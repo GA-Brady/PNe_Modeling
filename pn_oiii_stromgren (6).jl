@@ -1,0 +1,2227 @@
+### A Pluto.jl notebook ###
+# v0.20.24
+
+using Markdown
+using InteractiveUtils
+
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
+macro bind(def, element)
+    #! format: off
+    return quote
+        local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
+        local el = $(esc(element))
+        global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
+        el
+    end
+    #! format: on
+end
+
+# ╔═╡ 750040b4-5c78-11f1-86ff-57f7a95bfe26
+begin
+    using Plots
+    using PlutoUI
+    using QuadGK
+    using Roots
+    using DataFrames
+    using Statistics
+end
+
+# ╔═╡ 7500415e-5c78-11f1-9f35-a1b8723f361c
+md"""
+# Planetary Nebula [O III] λ5007 — Physical Luminosity Model
+
+**Physics included:**
+1. Saha ionization equilibrium (corrected CGS prefactor, T in Kelvin)
+2. Collisional excitation rate q(T) with Boltzmann factor exp(−ΔE/kT)
+3. Collisional de-excitation quenching: ε/(1 + nₑ/n\_crit(T))
+4. Self-consistent Strömgren truncation — emissivity zeroed beyond r\_S,
+   where r\_S is solved from the stellar ionizing photon budget Q(H⁰)
+5. Post-AGB central star evolution: L★(t̄, M\_cs) and T★(t̄, M\_cs)
+6. Wind-anchored density: n₀ from Ṁ/(4π r²\_★ vw μ mH); log(n₀) ~ 14
+7. **Shock-derived σ(t) and b(t)**: shell width grows as the shock
+   decelerates (Rankine-Hugoniot + Villaver+2002); ionization-front
+   sharpness b falls as nₑ drops with expansion. Neither is a free
+   parameter — both are computed from physical shock inputs.
+"""
+
+# ╔═╡ 75004352-5c78-11f1-840e-f94b7b0cb952
+begin
+    # ── Physical constants ───────────────────────────────────────────────────
+    const kB_eV   = 8.617333e-5    # eV K⁻¹
+    const eV2K    = 1.0 / kB_eV   # K per eV
+    const eV2erg  = 1.602176e-12   # erg per eV
+
+    # Saha prefactor: 2·(2π mₑ kB / h²)^(3/2)  [cm⁻³ K⁻³/²]
+    const SAHA_A  = 4.8288e15
+
+    # ── Oxygen atomic data ───────────────────────────────────────────────────
+    const g_O   = [9, 4, 1, 2, 1, 2]
+    const E_ion = [13.618, 35.121, 54.936, 77.413, 113.899]   # eV
+
+    # ── [O III] λ5007 transition ─────────────────────────────────────────────
+    const E5007_eV  = 2.4792
+    const hν5007    = E5007_eV * eV2erg      # erg
+
+    # Effective collision strength (Mendoza 1983; Lennon & Burke 1994)
+    const Ω_OIII   = 2.29
+    const g_upper  = 5
+
+    # Einstein A coefficient for [O III] λ5007  (Storey & Zeippen 2000)
+    const A_ul_5007 = 0.02101    # s⁻¹
+
+    # ── Hydrogen recombination ───────────────────────────────────────────────
+    # Case B at T ~ 10⁴ K
+    const α_B     = 2.6e-13     # cm³ s⁻¹
+
+    # ── Nebula length scale ──────────────────────────────────────────────────
+    const r_star_cm = 1.0e17    # cm  (dimensionless r̄ unit)
+
+    # ── PNLF empirical cutoff ────────────────────────────────────────────────
+    const logL_sun        = 33.582          # log₁₀(L☉ / erg s⁻¹)
+    const M_sun_5007      = 6.87            # absolute mag of Sun in [O III] band
+    const M_star_ciardullo = -4.47          # Ciardullo et al. 2002
+    const logL_PNLF_star  = 36.40
+
+    nothing
+end
+
+# ╔═╡ 750047a6-5c78-11f1-b0f5-a3e227c6c8b9
+md"""
+## 1 · Saha Ionization Equilibrium
+
+$$\frac{n_{i+1}\,n_e}{n_i} = A\,T_K^{3/2}\,\frac{g_{i+1}}{g_i}\exp\!\left(-\frac{\chi_i}{kT}\right)$$
+
+Prefactor $A = 4.829\times10^{15}\ \mathrm{cm^{-3}\,K^{-3/2}}$; energies in eV; temperature
+converted to K before applying the prefactor.
+"""
+
+# ╔═╡ 750049ec-5c78-11f1-a424-355252dfd23f
+"""
+    saha_ratios(nₑ, T_eV) → Vector{Float64}
+
+Number fractions [f₀…f₅] for O⁰ through O⁵ in Saha equilibrium.
+"""
+function saha_ratios(nₑ::Float64, T_eV::Float64)
+    (T_eV <= 0.0 || nₑ <= 0.0) && return fill(NaN, 6)
+    T_K    = T_eV * eV2K
+    factor = SAHA_A * T_K^1.5 / nₑ
+    chain  = ones(Float64, 6)
+    for i in 1:5
+        chain[i+1] = chain[i] * factor * (g_O[i+1] / g_O[i]) * exp(-E_ion[i] / T_eV)
+    end
+    Z_tot = sum(chain)
+    return chain ./ Z_tot
+end
+
+# ╔═╡ 75004b22-5c78-11f1-acf0-7b11d63751b1
+md"""
+## 2 · Collisional Excitation Rate
+
+$$q_{12}(T) = \frac{8.629\times10^{-6}}{\sqrt{T_K}}\cdot\frac{\Omega}{g_u}\cdot\exp\!\left(-\frac{\Delta E}{kT}\right)$$
+
+The exponential **must** be present: this is the excitation coefficient.
+The form without exp(−ΔE/kT) is the *de*-excitation coefficient q₂₁,
+related by detailed balance q₁₂ = (gᵤ/gₗ)·q₂₁·exp(−ΔE/kT).
+"""
+
+# ╔═╡ 75004c26-5c78-11f1-8f7c-29928c62cbd8
+"""
+    q_eff(T_eV) → Float64
+
+Collisional excitation rate coefficient for [O III] λ5007 (cm³ s⁻¹).
+Includes the Boltzmann suppression factor exp(−E5007/T).
+"""
+function q_eff(T_eV::Float64)
+    T_eV <= 0.0 && return 0.0
+    T_K = T_eV * eV2K
+    return 8.629e-6 / sqrt(T_K) * Ω_OIII / g_upper * exp(-E5007_eV / T_eV)
+end
+
+# ╔═╡ 75004cf8-5c78-11f1-8454-c95a65b074db
+md"""
+## 3 · Collisional De-excitation: Critical Density
+
+At $n_e \gg n_\mathrm{crit}$ the upper level is thermalised by collisions before
+it can radiate, suppressing the line: $\varepsilon \to \varepsilon/(1 + n_e/n_\mathrm{crit})$.
+
+$$n_\mathrm{crit}(T) = \frac{A_{ul}}{q_{ul}(T)}$$
+
+For [O III] λ5007: $A_{ul} = 0.021\ \mathrm{s^{-1}}$, giving
+$n_\mathrm{crit} \approx 6.8\times10^5\ \mathrm{cm^{-3}}$ at $T = 10^4$ K.
+The T-dependent form is used so the quenching threshold varies across the shell profile.
+"""
+
+# ╔═╡ 75004dfc-5c78-11f1-8224-05b6784be610
+"""
+    ne_crit(T_eV) → Float64
+
+T-dependent critical density (cm⁻³) for [O III] λ5007.
+n_crit = A_ul / q_ul  where q_ul is the de-excitation rate coefficient.
+"""
+function ne_crit(T_eV::Float64)
+    T_eV <= 0.0 && return Inf
+    T_K  = T_eV * eV2K
+    # de-excitation rate: q_ul = 8.629e-6 * Ω / (g_upper * sqrt(T_K))
+    # (no Boltzmann factor: this is the downward rate)
+    q_ul = 8.629e-6 * Ω_OIII / (g_upper * sqrt(T_K))
+    return A_ul_5007 / q_ul
+end
+
+# ╔═╡ 75004f0a-5c78-11f1-8801-b529eb9a8616
+md"""
+## 4 · Density and Temperature Profiles
+
+**Wind-anchored density.** From mass continuity $\dot{M} = 4\pi r^2 \rho v_w$:
+
+$$n_e(r) = \frac{\dot{M}}{4\pi r^2 v_w \mu m_H} \equiv \frac{n_0}{(r+\varepsilon)^2}$$
+
+For $\dot{M}=10^{-5}\ M_\odot\ \mathrm{yr}^{-1}$, $v_w=10\ \mathrm{km\,s}^{-1}$,
+$r_\star=10^{14}\ \mathrm{cm}$: $\log n_0 \approx 14$.
+The swept shell compresses this into a Gaussian of width $\sigma(t)$ at $r=t$:
+
+$$\bar{n}(r,t) = \frac{n_0}{(r+\varepsilon)^2}
+  \cdot \frac{1}{\sqrt{\pi}\,\sigma(t)}\exp\!\left[-\frac{(r-t)^2}{\sigma(t)^2}\right]$$
+
+**Shock-derived shell width $\sigma(t)$.**
+For a strong adiabatic shock the compression ratio is $(\gamma+1)/(\gamma-1) = 4$,
+giving $\Delta r/r \approx 1/4$ initially. As the shock decelerates into the
+$\rho\propto r^{-2}$ AGB wind the compression weakens and the shell broadens
+(Villaver et al. 2002):
+
+$$\sigma(t) = \sigma_0 \left(1 + \frac{t}{t_\mathrm{thin}}\right)^\beta$$
+
+$\sigma_0 \approx 0.02$–$0.05$ (strong-shock limit), $\beta \approx 0.3$–$0.5$.
+
+**Shock-derived ionization-front sharpness $b(t)$.**
+The sigmoid width $\sim 1/b$ equals the ionization-front thickness
+$\ell_\mathrm{IF} = v_\mathrm{IF}/(\alpha_B n_e)$.
+Since $n_e \propto n_0/(t+\varepsilon)^2$ at the shell peak, $b$ falls with time
+as the density drops:
+
+$$b(t) = \frac{r_\star \cdot \alpha_B \cdot n_e^\mathrm{peak}(t)}{v_\mathrm{IF}}$$
+
+clamped to $[1, 50]$. A fast R-type front ($v_\mathrm{IF} \sim 100\ \mathrm{km\,s}^{-1}$)
+gives a sharp early transition; the D-type phase ($v_\mathrm{IF} \sim 10\ \mathrm{km\,s}^{-1}$)
+broadens it. Neither $\sigma$ nor $b$ is a free geometric parameter.
+"""
+
+# ╔═╡ 19311ee4-6a9e-4f44-81fb-2a88a6e60ecd
+"""
+    n_profile(r, t, n0, σ; ε) → Float64
+
+Wind-anchored electron density (cm⁻³). r⁻² wind × Gaussian shell at r = t.
+ε softens the origin singularity; no ε² numerator (that was a normalization artefact).
+"""
+function n_profile(r::Float64, t::Float64, n0::Float64, σ::Float64; ε::Float64=0.02)
+    r < 0.0 && return 0.0
+    wind  = 1.0 / (r + ε)^2
+    shell = exp(-(r - t)^2 / σ^2) / (sqrt(π) * σ)
+    return n0 * wind * shell
+end
+
+# ╔═╡ 5341bba7-d2fd-4f3c-a8ef-6237320e9fc9
+function T_profile(r::Float64, t::Float64, T_in::Float64, T_out::Float64, b::Float64)
+    return T_in - (T_in - T_out) / (1.0 + exp(-b * (r - t)))
+end
+
+# ╔═╡ 750053ce-5c78-11f1-9dbe-9b670302fb24
+md"## 4b · Shock-Derived σ(t) and b(t)"
+
+# ╔═╡ f60a36d4-438a-407b-850e-dedea28a4dad
+"""
+    sigma_shell(t; sigma0, t_thin, beta) → Float64
+
+Shell thickness (dimensionless) as a function of evolutionary time t̄.
+Grows as the shock decelerates from the strong (thin) to weak (broad) limit.
+
+  sigma0  : initial width at t → 0  (strong Rankine-Hugoniot shock, ≈ 0.02–0.05)
+  t_thin  : shock-weakening timescale in t̄ units  (≈ 1–3)
+  beta    : broadening exponent from hydro simulations  (≈ 0.3–0.5, Villaver+2002)
+"""
+function sigma_shell(t::Float64;
+                     sigma0::Float64 = 0.03,
+                     t_thin::Float64 = 1.5,
+                     beta::Float64   = 0.4)
+    return sigma0 * (1.0 + t / t_thin)^beta
+end
+
+# ╔═╡ d662d5e4-fd98-4e53-adad-4cd891845072
+"""
+    b_transition(t, n0; v_IF_kms) → Float64
+
+Temperature-transition sharpness b(t) from ionization-front physics.
+b ~ r_★ · α_B · nₑ_peak(t) / v_IF, where nₑ_peak uses the current σ(t).
+Falls with time as the shell density drops with expansion.
+Clamped to [1, 50] for numerical stability.
+
+  v_IF_kms : ionization-front speed (km/s)
+             ~100  R-type (early, star heating up)
+             ~10   D-type (settled, pressure-driven)
+"""
+function b_transition(t::Float64, n0::Float64;
+                      sigma0::Float64   = 0.03,
+                      t_thin::Float64   = 1.5,
+                      beta::Float64     = 0.4,
+                      v_IF_kms::Float64 = 20.0)
+    σ_t    = sigma_shell(t; sigma0, t_thin, beta)
+    # Peak density at shell centre r = t
+    ne_pk  = n_profile(t, t, n0, σ_t)
+    v_IF   = v_IF_kms * 1.0e5              # km/s → cm/s
+    # IF thickness in dimensionless units: ℓ = v_IF / (α_B · nₑ · r_★)
+    ne_pk  = max(ne_pk, 1.0)              # guard against zero
+    ell_IF = v_IF / (α_B * ne_pk * r_star_cm)
+    return clamp(1.0 / max(ell_IF, 1e-6), 1.0, 50.0)
+end
+
+# ╔═╡ 75005716-5c78-11f1-bc43-4d094e1e6582
+md"""
+## 5 · Post-AGB Stellar Evolution
+
+Parameterised tracks following Schönberner (1983) and Vassiliadis & Wood (1994).
+
+- Peak luminosity: $\log(L_\star/L_\odot) \approx 3.74 + 1.92\,(M_{cs}-0.55)$
+- Crossing timescale: $\log(t_\mathrm{cross}/\mathrm{yr}) \approx 5.24 - 6.95\,(M_{cs}-0.55)$
+- Higher mass → faster, hotter, brighter → larger $Q(H^0)$
+
+The Lyman continuum photon rate uses a blackbody approximation with
+ionizing fraction $f_\mathrm{ion} \approx \exp(-0.92\,x^{0.55})$
+where $x = h\nu_\mathrm{Ly}/kT_\star$.
+"""
+
+# ╔═╡ 7ceb63c4-bfd3-40db-9737-fe38603af6e3
+"""
+    postaGB_track(M_cs, t_bar) → (L_star_erg, T_star_K)
+
+Post-AGB central star luminosity (erg/s) and effective temperature (K)
+at dimensionless evolutionary time t̄, for a CS of mass M_cs (M☉).
+
+T_star_K is no longer clamped at 1e4 K — the caller (Q_H0) handles the
+low-temperature regime smoothly, so clamping here was masking the physical
+fade and causing r_S to stay falsely large at late t̄ before snapping to zero.
+"""
+function postaGB_track(M_cs::Float64, t_bar::Float64)
+    logL_peak_sun = 3.74 + 1.92 * (M_cs - 0.55)
+    L_peak   = 10.0^(logL_peak_sun + logL_sun)
+    T_peak_K = 1.4e5 * (M_cs / 0.6)^2.0
+    t_pk     = 0.8
+
+    L_star = if t_bar <= t_pk
+        L_peak * exp(-4.0 * ((t_bar - t_pk) / t_pk)^2)
+    else
+        L_peak * (t_bar / t_pk)^(-1.8)
+    end
+
+    T_star_K = if t_bar <= t_pk
+        T_peak_K * exp(-2.0 * ((t_bar - t_pk) / t_pk)^2)
+    else
+        T_peak_K * (t_bar / t_pk)^(-0.9)
+    end
+    # No floor clamp: let T_star_K fall naturally.
+    # Q_H0 evaluates smoothly to near-zero as T★ cools below ~3×10⁴ K.
+    T_star_K = max(T_star_K, 1.0e3)   # only prevent exactly zero
+
+    return L_star, T_star_K
+end
+
+# ╔═╡ 3b443af6-e911-4324-86e3-6e58ec0733e7
+"""
+    Q_H0(T_star_K, L_star_erg) → photons s⁻¹
+
+Lyman continuum photon rate from a blackbody central star.
+
+Replaces the hard threshold at 2×10⁴ K with a smooth exponential suppression.
+The old `T <= 2e4 → return 0` created a cliff: r_S was finite one step before
+the threshold and exactly zero one step after, producing a discontinuous drop
+in L(t̄). The corrected form uses the same blackbody fraction fit but lets it
+decay smoothly to zero as T★ → 0, with no hard cutoff.
+"""
+function Q_H0(T_star_K::Float64, L_star_erg::Float64)
+    T_star_K <= 0.0 && return 0.0
+    x = 13.6 / (kB_eV * T_star_K)    # hν_Ly / kT★
+    # Blackbody ionizing fraction: smooth for all x > 0, → 0 as x → ∞
+    # exp(-0.92 * x^0.55) already goes to 0 continuously — no hard cutoff needed
+    x > 150.0 && return 0.0           # numerical underflow guard only
+    f_ion  = exp(-0.92 * x^0.55)
+    E_mean = 2.0 * 13.6 * eV2erg
+    return f_ion * L_star_erg / E_mean
+end
+
+# ╔═╡ 75005b8a-5c78-11f1-9cd9-4f990e691ee0
+md"""
+## 6 · Strömgren Truncation
+
+The ionization-bounded radius $r_S$ is found by integrating the recombination
+rate outward until the stellar ionizing budget is exhausted:
+
+$$Q(H^0) = \int_0^{r_S} \alpha_B\,n_e^2(r)\,4\pi r^2\,dr \cdot r_\star^3$$
+
+The emissivity is zeroed for $r > r_S$. Three regimes:
+- *Ionization-bounded* (dense shell): $r_S$ inside shell; inner face only.
+- *Density-bounded* (dilute shell): $r_S$ beyond shell; full shell visible.
+- *Cooling star* (late t̄): Q drops smoothly, $r_S$ retreats continuously.
+
+**Late-time behaviour.** When $Q(H^0) \to 0$ as the star cools, $r_S \to 0$
+and $L \to$ NaN (no ionized volume). This is correct physics — the PN fades.
+The onset is now smooth because `Q_H0` has no hard threshold and
+`stromgren_radius` returns `r_S > 0` for any `Q_ion > 0`.
+"""
+
+# ╔═╡ 75005cf2-5c78-11f1-80ad-d946ab7efb63
+"""
+    stromgren_radius(t, n0, σ, Q_ion) → r_S (dimensionless)
+
+Locate r_S by bisection on the cumulative recombination integral.
+Returns r_max (density-bounded) if Q_ion exceeds total recombinations.
+Returns 0.0 only if Q_ion is exactly zero (caller should check).
+
+The Q_ion ≈ 0 early-exit that previously returned 0.0 for any small Q
+is removed — at late t̄ when Q is small but nonzero the star still
+ionizes a thin inner skin, which is physical and should be computed.
+The bisection naturally finds a very small r_S in this regime.
+"""
+function stromgren_radius(t::Float64, n0::Float64, σ::Float64, Q_ion::Float64)
+    Q_ion <= 0.0 && return 0.0
+
+    r_max = t + 6.0 * σ + 0.3
+
+    rec_integrand(r) = r <= 0.0 ? 0.0 :
+        α_B * n_profile(r, t, n0, σ)^2 * 4π * r^2 * r_star_cm^3
+
+    # Total recombinations in whole domain — pass shell peak as breakpoint
+    Q_total, _ = quadgk(rec_integrand, 0.0, t, r_max;
+                         rtol=1e-4, atol=0.0, order=21)
+
+    # Density-bounded: star ionizes more than the whole shell
+    Q_total <= Q_ion && return r_max
+
+    # Bisection on cumulative integral — monotone, single zero guaranteed
+    lo, hi = 0.0, r_max
+    for _ in 1:60
+        mid    = 0.5 * (lo + hi)
+        # Pass shell peak as breakpoint if it lies in [0, mid]
+        bp     = (t < mid) ? (0.0, t, mid) : (0.0, mid)
+        Q_mid, _ = quadgk(rec_integrand, bp...; rtol=1e-3, atol=0.0, order=15)
+        Q_mid < Q_ion ? (lo = mid) : (hi = mid)
+        hi - lo < 1e-7 * r_max && break
+    end
+
+    return 0.5 * (lo + hi)
+end
+
+# ╔═╡ 75005f86-5c78-11f1-9cfd-4d9ba9911a13
+md"""
+## 7 · Shell Luminosity with Full Physics
+
+$$L_{5007}(t) = \int_0^{r_S} \varepsilon(r,t)\,4\pi r^2\,dr\cdot r_\star^3$$
+
+$$\varepsilon = \frac{n_e^2 \cdot Z \cdot f_{\mathrm{O}^{2+}} \cdot q(T) \cdot h\nu_{5007}}
+                    {1 + n_e/n_\mathrm{crit}(T)}$$
+
+**Oscillation suppression.** Three measures are taken to produce a smooth
+$L(\bar{t})$ curve:
+
+1. `r_S` is solved via binary search on a `quadgk`-based cumulative integral,
+   not a fixed Riemann sum, so it varies continuously with $\bar{t}$.
+2. The luminosity integral passes `r_S` and the shell peak $r = t$ as
+   explicit breakpoints to `quadgk`, so the discontinuity at $r_S$ and the
+   Gaussian spike at $r = t$ are treated as interval boundaries rather than
+   interior features the integrator must discover adaptively.
+3. Integration order is raised to 21 (from the default 7) to resolve the
+   narrow Gaussian shell at high $n_0$.
+"""
+
+# ╔═╡ 75006120-5c78-11f1-b0bd-5576b2d9b6cc
+"""
+    shell_luminosity(t, n0, T_in, T_out, σ, Z, b, Q_ion) → Float64
+
+[O III] λ5007 luminosity (log₁₀ erg/s). Oscillation fixes applied:
+  - r_S solved smoothly via bisection on quadgk cumulative integral
+  - Explicit breakpoints at r=t (shell peak) and r=r_S (jump discontinuity)
+  - Integration order=21 to resolve narrow Gaussian shell
+"""
+function shell_luminosity(t::Float64, n0::Float64, T_in::Float64, T_out::Float64,
+                          σ::Float64, Z::Float64, b::Float64, Q_ion::Float64)
+
+    r_S = stromgren_radius(t, n0, σ, Q_ion)
+    (r_S <= 0.0) && return NaN
+
+    # Upper limit: min of r_S and the effective shell tail
+    r_max = min(r_S, t + 6.0 * σ + 0.3)
+    r_max <= 0.0 && return NaN
+
+    # Breakpoints: origin, shell peak, Strömgren surface
+    # quadgk integrates each sub-interval separately — no discontinuity aliasing
+    r_peak = clamp(t, 0.0, r_max)   # shell Gaussian peaks at r = t
+    breakpoints = sort(unique(filter(r -> 0.0 < r < r_max,
+                                     [r_peak, r_S])))
+
+    emissivity(r) = begin
+        r <= 0.0 && return 0.0
+        nₑ = n_profile(r, t, n0, σ)
+        nₑ < 1e-6 && return 0.0
+        T  = T_profile(r, t, T_in, T_out, b)
+        T  <= 0.0 && return 0.0
+        fracs = saha_ratios(nₑ, T)
+        any(isnan, fracs) && return 0.0
+        f_O2p = fracs[3]
+        q     = q_eff(T)
+        n_c   = ne_crit(T)
+        ε = nₑ^2 * Z * f_O2p * q * hν5007 / (1.0 + nₑ / n_c)
+        return ε * 4π * r^2
+    end
+
+    # Integrate over [0, r_max] with explicit breakpoints
+    val, err = quadgk(emissivity, 0.0, breakpoints..., r_max;
+                       rtol=1e-5, atol=0.0, order=21)
+
+    L = val * r_star_cm^3
+    return (L > 0.0 && isfinite(L)) ? log10(L) : NaN
+end
+
+# ╔═╡ 75006406-5c78-11f1-9327-a5aed19a90c7
+md"## 8 · Nebula Parameter Struct"
+
+# ╔═╡ 8f6ee0dd-d70d-425a-a723-a510699f4819
+"""
+    NebParams
+
+Physical parameters of a single nebula and its central star.
+σ and b are NOT stored — they are computed at each t̄ from shock dynamics.
+"""
+struct NebParams
+    n0     :: Float64   # wind density at r̄ = 1  (cm⁻³); from Ṁ/4πr²vw
+    T_in   :: Float64   # post-shock inner temperature (eV)
+    T_out  :: Float64   # outer (recombined) temperature (eV)
+    Z      :: Float64   # oxygen abundance (O/H by number)
+    M_cs   :: Float64   # central star mass (M☉)
+	t_born :: Float64   # ΔT after 8M☉ evolves to PNe
+    # Shock parameters — govern σ(t)
+    sigma0 :: Float64   # initial shell width (strong-shock limit, ≈ 0.02–0.05)
+    t_thin :: Float64   # shock-weakening timescale (t̄ units, ≈ 1–3)
+    beta   :: Float64   # shell-broadening exponent (≈ 0.3–0.5)
+    # Ionization-front parameter — governs b(t)
+    v_IF   :: Float64   # ionization-front speed (km/s); ~100 R-type, ~10 D-type
+end
+
+# ╔═╡ 115fb9e7-6962-465c-a3bf-d7def61a5ff0
+"""
+    luminosity_at(t, nb) → Float64
+
+log₁₀ L([O III] 5007) at time t̄. Computes σ(t) and b(t) from shock
+physics, then threads Q(H⁰) from the post-AGB track into shell_luminosity.
+"""
+function luminosity_at(t::Float64, nb::NebParams)
+    σ = sigma_shell(t; sigma0=nb.sigma0, t_thin=nb.t_thin, beta=nb.beta)
+    b = b_transition(t, nb.n0;
+                     sigma0=nb.sigma0, t_thin=nb.t_thin, beta=nb.beta,
+                     v_IF_kms=nb.v_IF)
+    L_star, T_star_K = postaGB_track(nb.M_cs, t)
+    Q = Q_H0(T_star_K, L_star)
+    return shell_luminosity(t, nb.n0, nb.T_in, nb.T_out, σ, nb.Z, b, Q)
+end
+
+# ╔═╡ 750066ac-5c78-11f1-b3a2-9db1660107d3
+md"""
+## 9 · Interactive Explorer
+
+Sliders are now **physical shock parameters** — σ and b are derived from
+them at each t̄ rather than being set by hand.
+"""
+
+# ╔═╡ 7500671a-5c78-11f1-b78f-39c8612d1ae7
+@bind log_n0 Slider(10.0:0.1:16.0; default=14.0, show_value=true)
+
+# ╔═╡ 75006760-5c78-11f1-b4ee-3597d3ca9ccb
+@bind T_inner Slider(0.5:0.01:1.5; default=0.82, show_value=true)
+
+# ╔═╡ 75006792-5c78-11f1-bd09-693a38217067
+@bind T_outer Slider(0.3:0.01:0.9; default=0.66, show_value=true)
+
+# ╔═╡ 750067ba-5c78-11f1-8556-7d393c995389
+@bind log_Z Slider(-3.0:0.05:-1.0; default=-1.7, show_value=true)
+
+# ╔═╡ 750067e2-5c78-11f1-9946-2f839c5003e8
+@bind M_p Slider(0.8:0.01:7.85; default=0.60, show_value=true)
+
+# ╔═╡ 75006814-5c78-11f1-9c91-9bf4f5d05c9d
+@bind sigma0 Slider(0.01:0.005:0.10; default=0.03, show_value=true)
+
+# ╔═╡ 75006846-5c78-11f1-8a7f-93c504214586
+@bind t_thin Slider(0.5:0.1:4.0; default=1.5, show_value=true)
+
+# ╔═╡ 7500686c-5c78-11f1-818f-5f462740e446
+@bind beta_exp Slider(0.1:0.05:0.8; default=0.4, show_value=true)
+
+# ╔═╡ 75006896-5c78-11f1-b081-99c9263e0b83
+@bind v_IF Slider(5.0:5.0:150.0; default=20.0, show_value=true)
+
+# ╔═╡ 5e0429e6-9f6f-484e-a663-1db116c41ff3
+begin
+	function IFMR(M_p::Float64)
+		# initial final mass relation for white dwarfs from Catalan 2008
+		M_f = M_p < 2.7 ? 0.096 * M_p + 0.429 : 0.137 * M_p + 0.318
+		return M_f
+	end
+
+	function t_MS(M_p::Float64)
+		# main sequence crossing time from schonberner
+		# normalized to 8M☉ because those are the fastest to evolve to PNe
+		t_MS = ((M_p)^(-2.5) - 8^(-2.5)) * 1e10
+		return t_MS
+	end
+end
+
+# ╔═╡ 75006a06-5c78-11f1-8afc-8161a1b314c8
+begin
+	M_cs = IFMR(M_p)
+	t_born = t_MS(M_p)
+		
+    nb = NebParams(
+        10.0^log_n0,
+        T_inner,
+        T_outer,
+        10.0^log_Z,
+        M_cs,
+		t_born,
+        sigma0,
+        t_thin,
+        beta_exp,
+        v_IF
+    )
+	
+	t_vec = collect(0.05:0.08:7.0) 
+
+    # σ(t) and b(t) across the evolution
+    σ_vec = [sigma_shell(t; sigma0=nb.sigma0, t_thin=nb.t_thin, beta=nb.beta) for t in t_vec]
+    b_vec = [b_transition(t, nb.n0;
+                          sigma0=nb.sigma0, t_thin=nb.t_thin, beta=nb.beta,
+                          v_IF_kms=nb.v_IF) for t in t_vec]
+
+    # Luminosity curve
+    L_curve = [luminosity_at(t, nb) for t in t_vec]
+
+    # Central star track
+    cs_track    = [postaGB_track(nb.M_cs, t) for t in t_vec]
+    L_star_vec  = [cs[1] for cs in cs_track]
+    T_star_vec  = [cs[2] for cs in cs_track]
+    Q_vec       = Q_H0.(T_star_vec, L_star_vec)
+
+    # Strömgren radii (using σ(t) at each step)
+    r_S_vec        = [stromgren_radius(t, nb.n0, σ_vec[i], Q_vec[i])
+                      for (i, t) in enumerate(t_vec)]
+    r_shell_inner  = max.(t_vec .- σ_vec, 0.0)
+    r_shell_outer  = t_vec .+ σ_vec
+
+    # Peak luminosity
+    valid_mask = .!isnan.(L_curve)
+    logL_peak  = NaN; t_peak = NaN; f_O2p_peak = NaN
+
+    if any(valid_mask)
+        idx       = argmax(L_curve[valid_mask])
+        valid_idx = findall(valid_mask)
+        peak_abs  = valid_idx[idx]
+        t_peak    = t_vec[peak_abs]
+        logL_peak = L_curve[peak_abs]
+        σ_peak    = σ_vec[peak_abs]
+        b_peak    = b_vec[peak_abs]
+        nₑ_pk     = n_profile(t_peak, t_peak, nb.n0, σ_peak)
+        T_pk      = T_profile(t_peak, t_peak, nb.T_in, nb.T_out, b_peak)
+        fr_pk     = nₑ_pk > 0 ? saha_ratios(nₑ_pk, T_pk) : fill(NaN, 6)
+        f_O2p_peak = fr_pk[3]
+    end
+
+    ΔM_star = isnan(logL_peak) ? NaN : -(logL_peak - logL_PNLF_star) / 2.5
+
+    nothing
+end
+
+# ╔═╡ 750068c8-5c78-11f1-8cfd-895d7ce3af27
+md"""
+| Parameter | Value | Physical meaning |
+|-----------|-------|-----------------|
+| log₁₀(n₀ / cm⁻³) | $(log_n0) | Wind density at r̄ = 1 from Ṁ/4πr²vw |
+| T\_inner (eV) | $(T_inner) | Post-shock ionized gas temperature |
+| T\_outer (eV) | $(T_outer) | Outer recombined gas temperature |
+| log₁₀(Z / Z☉) | $(log_Z) | Oxygen abundance |
+| M\_cs (M☉) | $(M_cs) | Central star mass → Q(H⁰) and track speed |
+| σ₀ | $(sigma0) | Initial shell width (strong-shock limit, Δr/r ~ 1/4) |
+| t\_thin | $(t_thin) | Shock-weakening timescale (t̄ units) |
+| β | $(beta_exp) | Shell-broadening exponent (Villaver+2002) |
+| v\_IF (km/s) | $(v_IF) | Ionization-front speed (~100 R-type, ~10 D-type) |
+"""
+
+# ╔═╡ 75006d7a-5c78-11f1-b5ae-a59af69ed196
+md"""
+### Peak luminosity summary
+
+| Quantity | Value |
+|----------|-------|
+| Peak log₁₀(L₅₀₀₇ / erg s⁻¹) | $(round(logL_peak; digits=2)) |
+| Peak time t̄ | $(round(t_peak; digits=2)) |
+| f(O²⁺) at peak | $(round(f_O2p_peak * 100; digits=1)) % |
+| Offset from PNLF M★ | ΔM = $(round(ΔM_star; digits=2)) mag |
+| σ(t̄\_peak) — shock-derived | $(round(isnan(t_peak) ? NaN : sigma_shell(t_peak; sigma0=nb.sigma0, t_thin=nb.t_thin, beta=nb.beta); digits=4)) |
+| b(t̄\_peak) — IF-derived | $(round(isnan(t_peak) ? NaN : b_transition(t_peak, nb.n0; sigma0=nb.sigma0, t_thin=nb.t_thin, beta=nb.beta, v_IF_kms=nb.v_IF); digits=2)) |
+| n\_crit at T\_inner | $(round(ne_crit(T_inner); sigdigits=3)) cm⁻³ |
+| log Q(H⁰) at peak | $(round(isnan(t_peak) ? NaN : log10(max(Q_vec[argmin(abs.(t_vec .- t_peak))], 1.0)); digits=2)) photons/s |
+"""
+
+# ╔═╡ 75007124-5c78-11f1-8494-ef72f2e80384
+begin
+    p1 = plot(;
+        xlabel     = "Evolutionary time t̄",
+        ylabel     = "log₁₀(L / erg s⁻¹)",
+        title      = "[O III] λ5007 Luminosity Evolution",
+        framestyle = :box, grid = true, gridalpha = 0.3,
+        legend     = :topright)
+
+    plot!(p1, t_vec[valid_mask], L_curve[valid_mask];
+        label = "log L([O III] 5007)", lw = 2.5, color = :steelblue)
+
+    if !isnan(logL_peak)
+        scatter!(p1, [t_peak], [logL_peak];
+            label = "Peak (t̄ = $(round(t_peak; digits=2)))",
+            color = :firebrick, markersize = 8, markershape = :star5)
+
+        hline!(p1, [logL_PNLF_star];
+            label = "PNLF M★ cutoff", ls = :dash,
+            color = :darkorange, lw = 1.5, alpha = 0.8)
+    end
+
+    p1
+end
+
+# ╔═╡ 750074f8-5c78-11f1-8c06-1f5fcb1748d8
+begin
+    # Strömgren radius vs shell extent over time
+    p2 = plot(;
+        xlabel     = "Evolutionary time t̄",
+        ylabel     = "Radius (dimensionless)",
+        title      = "Strömgren Radius vs Shell Extent",
+        framestyle = :box, grid = true, gridalpha = 0.3,
+        legend     = :topright)
+
+    plot!(p2, t_vec, r_S_vec;
+        label = "r_S (Strömgren)", lw = 2, color = :firebrick)
+    plot!(p2, t_vec, r_shell_outer;
+        label = "Shell outer (t̄ + σ)", lw = 1.5, ls = :dash, color = :steelblue)
+    plot!(p2, t_vec, r_shell_inner;
+        label = "Shell inner (t̄ − σ)", lw = 1.5, ls = :dot, color = :steelblue)
+
+    # Shade region where rS < shell outer (ionization-bounded)
+    ion_bounded = r_S_vec .< r_shell_outer
+    if any(ion_bounded)
+        t_ib  = t_vec[ion_bounded]
+        rS_ib = r_S_vec[ion_bounded]
+        ro_ib = r_shell_outer[ion_bounded]
+        plot!(p2, t_ib, rS_ib;
+            fillrange = ro_ib, fillalpha = 0.12,
+            color = :firebrick, label = "Ionization-bounded zone", lw = 0)
+    end
+
+    p2
+end
+
+# ╔═╡ 7500785e-5c78-11f1-970c-d7455477d7da
+begin
+    # Central star evolution
+    logL_star_sun = log10.(max.(L_star_vec, 1.0)) .- logL_sun
+    logT_star     = log10.(T_star_vec)
+
+    p3a = plot(t_vec, logL_star_sun;
+        xlabel = "t̄", ylabel = "log L★/L☉",
+        title  = "CS Luminosity", lw = 2, color = :darkorchid,
+        framestyle = :box, grid = true, gridalpha = 0.3, legend = false)
+
+    p3b = plot(t_vec, logT_star;
+        xlabel = "t̄", ylabel = "log T★ (K)",
+        title  = "CS Temperature", lw = 2, color = :firebrick,
+        framestyle = :box, grid = true, gridalpha = 0.3, legend = false)
+
+    logQ = log10.(max.(Q_vec, 1.0))
+    p3c = plot(t_vec, logQ;
+        xlabel = "t̄", ylabel = "log Q(H⁰) (photons/s)",
+        title  = "Ionizing Flux", lw = 2, color = :steelblue,
+        framestyle = :box, grid = true, gridalpha = 0.3, legend = false)
+
+    plot(p3a, p3b, p3c; layout = (1, 3), size = (900, 280),
+         margin = 5Plots.mm, titlefont = font(10))
+end
+
+# ╔═╡ 75007bb0-5c78-11f1-8ee5-f70353584904
+begin
+    # σ(t) and b(t): the two formerly-free parameters now derived from physics
+    p_sig = plot(t_vec, σ_vec;
+        xlabel = "Evolutionary time t̄", ylabel = "σ(t)",
+        title  = "Shell Width (shock-derived)",
+        lw = 2, color = :steelblue, framestyle = :box,
+        grid = true, gridalpha = 0.3, legend = false)
+    if !isnan(t_peak)
+        vline!(p_sig, [t_peak]; ls = :dash, color = :firebrick, lw = 1, label = "Peak t̄")
+    end
+
+    p_b = plot(t_vec, b_vec;
+        xlabel = "Evolutionary time t̄", ylabel = "b(t)",
+        title  = "IF Sharpness (density-derived)",
+        lw = 2, color = :darkorchid, framestyle = :box,
+        grid = true, gridalpha = 0.3, legend = false)
+    if !isnan(t_peak)
+        vline!(p_b, [t_peak]; ls = :dash, color = :firebrick, lw = 1, label = "Peak t̄")
+    end
+
+    # Shell peak density over time (to show the quenching regime)
+    ne_peak_vec = [n_profile(t, t, nb.n0, σ_vec[i]) for (i, t) in enumerate(t_vec)]
+    p_ne = plot(t_vec, log10.(max.(ne_peak_vec, 1.0));
+        xlabel = "Evolutionary time t̄", ylabel = "log₁₀ nₑ_peak (cm⁻³)",
+        title  = "Shell Peak Density",
+        lw = 2, color = :seagreen, framestyle = :box,
+        grid = true, gridalpha = 0.3, legend = :topright)
+    hline!(p_ne, [log10(ne_crit(T_inner))];
+        label = "n_crit(T_in)", ls = :dash, color = :darkorange, lw = 1.5)
+    if !isnan(t_peak)
+        vline!(p_ne, [t_peak]; ls = :dash, color = :firebrick, lw = 1, label = "Peak t̄")
+    end
+
+    plot(p_sig, p_b, p_ne; layout = (1, 3), size = (900, 280),
+         margin = 5Plots.mm, titlefont = font(10))
+end
+
+# ╔═╡ 7500a68a-5c78-11f1-88a0-f39ecb105ef8
+md"""
+## 11 · Numerical Diagnostics
+"""
+
+# ╔═╡ 7500a6e4-5c78-11f1-b0e9-47ef8ea57632
+begin
+    # Rows span from classical PN densities up to the wind-density regime.
+    # At n₀ = 10^14 the quenching factor is ~n_crit/n₀ ~ 10^-8:
+    # the shell core is essentially dark and emission comes from the flanks.
+    test_cases = [
+        (1e4,  0.82),    # classical low-density PN
+        (1e6,  0.82),    # at n_crit: quench ~ 0.5
+        (1e7,  0.82),    # above n_crit: quench ~ 0.07
+        (1e10, 0.82),    # dense inner wind
+        (1e12, 0.82),    # AGB envelope regime
+        (1e14, 0.82),    # wind-anchored n₀: quench ~ 7×10⁻⁹
+        (1e14, 1.2),     # same density, hotter
+    ]
+
+    rows = []
+    for (ne, T) in test_cases
+        fr  = saha_ratios(ne, T)
+        n_c = ne_crit(T)
+        q   = q_eff(T)
+        quench = 1.0 / (1.0 + ne / n_c)
+        push!(rows, (
+            nₑ       = ne,
+            T_eV     = T,
+            f_O2p    = round(fr[3]; digits=4),
+            n_crit   = round(n_c; sigdigits=3),
+            quench   = round(quench; digits=3),
+            q_eff    = round(q; sigdigits=3),
+            sum_fracs = round(sum(fr); digits=6)
+        ))
+    end
+
+    DataFrame(rows)
+end
+
+# ╔═╡ 00000000-0000-0000-0000-000000000001
+PLUTO_PROJECT_TOML_CONTENTS = """
+[deps]
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+QuadGK = "1fd47b50-473d-5c70-9696-f719f8f3bcdc"
+Roots = "f2b01f46-fcfa-551c-844a-d8ac1e96c665"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[compat]
+DataFrames = "~1.8.2"
+Plots = "~1.41.6"
+PlutoUI = "~0.7.61"
+QuadGK = "~2.11.3"
+Roots = "~2.2.10"
+"""
+
+# ╔═╡ 00000000-0000-0000-0000-000000000002
+PLUTO_MANIFEST_TOML_CONTENTS = """
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.12.5"
+manifest_format = "2.0"
+project_hash = "e47c1f1ef3995011d8598b19b74f2dc2a45d22be"
+
+[[deps.AbstractPlutoDingetjes]]
+deps = ["Pkg"]
+git-tree-sha1 = "6e1d2a35f2f90a4bc7c2ed98079b2ba09c35b83a"
+uuid = "6e696c72-6542-2067-7265-42206c756150"
+version = "1.3.2"
+
+[[deps.Accessors]]
+deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
+git-tree-sha1 = "2eeb2c9bef11013efc6f8f97f32ee59b146b09fb"
+uuid = "7d9f7c33-5ae7-4f3b-8dc6-eff91059b697"
+version = "0.1.44"
+
+    [deps.Accessors.extensions]
+    AxisKeysExt = "AxisKeys"
+    IntervalSetsExt = "IntervalSets"
+    LinearAlgebraExt = "LinearAlgebra"
+    StaticArraysExt = "StaticArrays"
+    StructArraysExt = "StructArrays"
+    TestExt = "Test"
+    UnitfulExt = "Unitful"
+
+    [deps.Accessors.weakdeps]
+    AxisKeys = "94b1ba4f-4ee9-5380-92f1-94cde586c3c5"
+    IntervalSets = "8197267c-284f-5f27-9208-e0e47529a953"
+    LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+    StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
+    Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+    Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[[deps.AliasTables]]
+deps = ["PtrArrays", "Random"]
+git-tree-sha1 = "9876e1e164b144ca45e9e3198d0b689cadfed9ff"
+uuid = "66dad0bd-aa9a-41b7-9441-69ab47430ed8"
+version = "1.1.3"
+
+[[deps.ArgTools]]
+uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
+version = "1.1.2"
+
+[[deps.Artifacts]]
+uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
+version = "1.11.0"
+
+[[deps.Base64]]
+uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+version = "1.11.0"
+
+[[deps.BitFlags]]
+git-tree-sha1 = "0691e34b3bb8be9307330f88d1a3c3f25466c24d"
+uuid = "d1d4a3ce-64b1-5f1a-9ba4-7e7e69966f35"
+version = "0.1.9"
+
+[[deps.Bzip2_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "1b96ea4a01afe0ea4090c5c8039690672dd13f2e"
+uuid = "6e34b625-4abd-537c-b88f-471c36dfa7a0"
+version = "1.0.9+0"
+
+[[deps.Cairo_jll]]
+deps = ["Artifacts", "Bzip2_jll", "CompilerSupportLibraries_jll", "Fontconfig_jll", "FreeType2_jll", "Glib_jll", "JLLWrappers", "Libdl", "Pixman_jll", "Xorg_libXext_jll", "Xorg_libXrender_jll", "Zlib_jll", "libpng_jll"]
+git-tree-sha1 = "1fa950ebc3e37eccd51c6a8fe1f92f7d86263522"
+uuid = "83423d85-b0ee-5818-9007-b63ccbeb887a"
+version = "1.18.7+0"
+
+[[deps.CodecZlib]]
+deps = ["TranscodingStreams", "Zlib_jll"]
+git-tree-sha1 = "962834c22b66e32aa10f7611c08c8ca4e20749a9"
+uuid = "944b1d66-785c-5afd-91f1-9de20f533193"
+version = "0.7.8"
+
+[[deps.ColorSchemes]]
+deps = ["ColorTypes", "ColorVectorSpace", "Colors", "FixedPointNumbers", "PrecompileTools", "Random"]
+git-tree-sha1 = "b0fd3f56fa442f81e0a47815c92245acfaaa4e34"
+uuid = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
+version = "3.31.0"
+
+[[deps.ColorTypes]]
+deps = ["FixedPointNumbers", "Random"]
+git-tree-sha1 = "b10d0b65641d57b8b4d5e234446582de5047050d"
+uuid = "3da002f7-5984-5a60-b8a6-cbb66c0b333f"
+version = "0.11.5"
+
+[[deps.ColorVectorSpace]]
+deps = ["ColorTypes", "FixedPointNumbers", "LinearAlgebra", "Requires", "Statistics", "TensorCore"]
+git-tree-sha1 = "a1f44953f2382ebb937d60dafbe2deea4bd23249"
+uuid = "c3611d14-8923-5661-9e6a-0046d554d3a4"
+version = "0.10.0"
+
+    [deps.ColorVectorSpace.extensions]
+    SpecialFunctionsExt = "SpecialFunctions"
+
+    [deps.ColorVectorSpace.weakdeps]
+    SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+
+[[deps.Colors]]
+deps = ["ColorTypes", "FixedPointNumbers", "Reexport"]
+git-tree-sha1 = "37ea44092930b1811e666c3bc38065d7d87fcc74"
+uuid = "5ae59095-9a9b-59fe-a467-6f913c188581"
+version = "0.13.1"
+
+[[deps.CommonSolve]]
+git-tree-sha1 = "dd91a10d8b8ae06e15706158eaf1a3e87e97b5f5"
+uuid = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
+version = "0.2.7"
+
+    [deps.CommonSolve.extensions]
+    CommonSolveEnzymeCoreExt = "EnzymeCore"
+
+    [deps.CommonSolve.weakdeps]
+    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+
+[[deps.Compat]]
+deps = ["TOML", "UUIDs"]
+git-tree-sha1 = "9d8a54ce4b17aa5bdce0ea5c34bc5e7c340d16ad"
+uuid = "34da2185-b29b-5c13-b0c7-acf172513d20"
+version = "4.18.1"
+weakdeps = ["Dates", "LinearAlgebra"]
+
+    [deps.Compat.extensions]
+    CompatLinearAlgebraExt = "LinearAlgebra"
+
+[[deps.CompilerSupportLibraries_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "e66e0078-7015-5450-92f7-15fbd957f2ae"
+version = "1.3.0+1"
+
+[[deps.CompositionsBase]]
+git-tree-sha1 = "802bb88cd69dfd1509f6670416bd4434015693ad"
+uuid = "a33af91c-f02d-484b-be07-31d278c5ca2b"
+version = "0.1.2"
+weakdeps = ["InverseFunctions"]
+
+    [deps.CompositionsBase.extensions]
+    CompositionsBaseInverseFunctionsExt = "InverseFunctions"
+
+[[deps.ConcurrentUtilities]]
+deps = ["Serialization", "Sockets"]
+git-tree-sha1 = "21d088c496ea22914fe80906eb5bce65755e5ec8"
+uuid = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
+version = "2.5.1"
+
+[[deps.ConstructionBase]]
+git-tree-sha1 = "b4b092499347b18a015186eae3042f72267106cb"
+uuid = "187b0558-2788-49d3-abe0-74a17ed4e7c9"
+version = "1.6.0"
+
+    [deps.ConstructionBase.extensions]
+    ConstructionBaseIntervalSetsExt = "IntervalSets"
+    ConstructionBaseLinearAlgebraExt = "LinearAlgebra"
+    ConstructionBaseStaticArraysExt = "StaticArrays"
+
+    [deps.ConstructionBase.weakdeps]
+    IntervalSets = "8197267c-284f-5f27-9208-e0e47529a953"
+    LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[[deps.Contour]]
+git-tree-sha1 = "439e35b0b36e2e5881738abc8857bd92ad6ff9a8"
+uuid = "d38c429a-6771-53c6-b99e-75d170b6e991"
+version = "0.6.3"
+
+[[deps.Crayons]]
+git-tree-sha1 = "249fe38abf76d48563e2f4556bebd215aa317e15"
+uuid = "a8cc5b0e-0ffa-5ad4-8c14-923d3ee1735f"
+version = "4.1.1"
+
+[[deps.DataAPI]]
+git-tree-sha1 = "abe83f3a2f1b857aac70ef8b269080af17764bbe"
+uuid = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
+version = "1.16.0"
+
+[[deps.DataFrames]]
+deps = ["Compat", "DataAPI", "DataStructures", "Future", "InlineStrings", "InvertedIndices", "IteratorInterfaceExtensions", "LinearAlgebra", "Markdown", "Missings", "PooledArrays", "PrecompileTools", "PrettyTables", "Printf", "Random", "Reexport", "SentinelArrays", "SortingAlgorithms", "Statistics", "TableTraits", "Tables", "Unicode"]
+git-tree-sha1 = "5fab31e2e01e70ad66e3e24c968c264d1cf166d6"
+uuid = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+version = "1.8.2"
+
+[[deps.DataStructures]]
+deps = ["OrderedCollections"]
+git-tree-sha1 = "e86f4a2805f7f19bec5129bc9150c38208e5dc23"
+uuid = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+version = "0.19.4"
+
+[[deps.DataValueInterfaces]]
+git-tree-sha1 = "bfc1187b79289637fa0ef6d4436ebdfe6905cbd6"
+uuid = "e2d170a0-9d28-54be-80f0-106bbe20a464"
+version = "1.0.0"
+
+[[deps.Dates]]
+deps = ["Printf"]
+uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
+version = "1.11.0"
+
+[[deps.Dbus_jll]]
+deps = ["Artifacts", "Expat_jll", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "473e9afc9cf30814eb67ffa5f2db7df82c3ad9fd"
+uuid = "ee1fde0b-3d02-5ea6-8484-8dfef6360eab"
+version = "1.16.2+0"
+
+[[deps.DelimitedFiles]]
+deps = ["Mmap"]
+git-tree-sha1 = "9e2f36d3c96a820c678f2f1f1782582fcf685bae"
+uuid = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+version = "1.9.1"
+
+[[deps.DocStringExtensions]]
+git-tree-sha1 = "7442a5dfe1ebb773c29cc2962a8980f47221d76c"
+uuid = "ffbed154-4ef7-542d-bbb7-c09d3a79fcae"
+version = "0.9.5"
+
+[[deps.Downloads]]
+deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
+uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+version = "1.7.0"
+
+[[deps.EpollShim_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "8a4be429317c42cfae6a7fc03c31bad1970c310d"
+uuid = "2702e6a9-849d-5ed8-8c21-79e8b8f9ee43"
+version = "0.0.20230411+1"
+
+[[deps.ExceptionUnwrapping]]
+deps = ["Test"]
+git-tree-sha1 = "d36f682e590a83d63d1c7dbd287573764682d12a"
+uuid = "460bff9d-24e4-43bc-9d9f-a8973cb893f4"
+version = "0.1.11"
+
+[[deps.Expat_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "c307cd83373868391f3ac30b41530bc5d5d05d08"
+uuid = "2e619515-83b5-522b-bb60-26c02a35a201"
+version = "2.8.1+0"
+
+[[deps.FFMPEG]]
+deps = ["FFMPEG_jll"]
+git-tree-sha1 = "95ecf07c2eea562b5adbd0696af6db62c0f52560"
+uuid = "c87230d0-a227-11e9-1b43-d7ebe4e7570a"
+version = "0.4.5"
+
+[[deps.FFMPEG_jll]]
+deps = ["Artifacts", "Bzip2_jll", "FreeType2_jll", "FriBidi_jll", "JLLWrappers", "LAME_jll", "Libdl", "Ogg_jll", "OpenSSL_jll", "Opus_jll", "PCRE2_jll", "Zlib_jll", "libaom_jll", "libass_jll", "libfdk_aac_jll", "libva_jll", "libvorbis_jll", "x264_jll", "x265_jll"]
+git-tree-sha1 = "cac41ca6b2d399adfc95e51240566f8a60a80806"
+uuid = "b22a6f82-2f65-5046-a5b2-351ab43fb4e5"
+version = "8.1.0+0"
+
+[[deps.FileWatching]]
+uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
+version = "1.11.0"
+
+[[deps.FixedPointNumbers]]
+deps = ["Statistics"]
+git-tree-sha1 = "05882d6995ae5c12bb5f36dd2ed3f61c98cbb172"
+uuid = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
+version = "0.8.5"
+
+[[deps.Fontconfig_jll]]
+deps = ["Artifacts", "Bzip2_jll", "Expat_jll", "FreeType2_jll", "JLLWrappers", "Libdl", "Libuuid_jll", "Zlib_jll"]
+git-tree-sha1 = "f85dac9a96a01087df6e3a749840015a0ca3817d"
+uuid = "a3f928ae-7b40-5064-980b-68af3947d34b"
+version = "2.17.1+0"
+
+[[deps.Format]]
+git-tree-sha1 = "9c68794ef81b08086aeb32eeaf33531668d5f5fc"
+uuid = "1fa38f19-a742-5d3f-a2b9-30dd87b9d5f8"
+version = "1.3.7"
+
+[[deps.FreeType2_jll]]
+deps = ["Artifacts", "Bzip2_jll", "JLLWrappers", "Libdl", "Zlib_jll"]
+git-tree-sha1 = "70329abc09b886fd2c5d94ad2d9527639c421e3e"
+uuid = "d7e528f0-a631-5988-bf34-fe36492bcfd7"
+version = "2.14.3+1"
+
+[[deps.FriBidi_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "7a214fdac5ed5f59a22c2d9a885a16da1c74bbc7"
+uuid = "559328eb-81f9-559d-9380-de523a88c83c"
+version = "1.0.17+0"
+
+[[deps.Future]]
+deps = ["Random"]
+uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
+version = "1.11.0"
+
+[[deps.GLFW_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Libglvnd_jll", "Xorg_libXcursor_jll", "Xorg_libXi_jll", "Xorg_libXinerama_jll", "Xorg_libXrandr_jll", "libdecor_jll", "xkbcommon_jll"]
+git-tree-sha1 = "9e0fb9e54594c47f278d75063980e43066e26e20"
+uuid = "0656b61e-2033-5cc2-a64a-77c0f6c09b89"
+version = "3.4.1+1"
+
+[[deps.GR]]
+deps = ["Artifacts", "Base64", "DelimitedFiles", "Downloads", "GR_jll", "HTTP", "JSON", "Libdl", "LinearAlgebra", "Preferences", "Printf", "Qt6Wayland_jll", "Random", "Serialization", "Sockets", "TOML", "Tar", "Test", "p7zip_jll"]
+git-tree-sha1 = "44716a1a667cb867ee0e9ec8edc31c3e4aa5afdc"
+uuid = "28b8d3ca-fb5f-59d9-8090-bfdbd6d07a71"
+version = "0.73.24"
+
+    [deps.GR.extensions]
+    IJuliaExt = "IJulia"
+
+    [deps.GR.weakdeps]
+    IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
+
+[[deps.GR_jll]]
+deps = ["Artifacts", "Bzip2_jll", "Cairo_jll", "FFMPEG_jll", "Fontconfig_jll", "FreeType2_jll", "GLFW_jll", "JLLWrappers", "JpegTurbo_jll", "Libdl", "Libtiff_jll", "Pixman_jll", "Qt6Base_jll", "Zlib_jll", "libpng_jll"]
+git-tree-sha1 = "be8a1b8065959e24fdc1b51402f39f3b6f0f6653"
+uuid = "d2c73de3-f751-5644-a686-071e5b155ba9"
+version = "0.73.24+0"
+
+[[deps.GettextRuntime_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl", "Libiconv_jll"]
+git-tree-sha1 = "45288942190db7c5f760f59c04495064eedf9340"
+uuid = "b0724c58-0f36-5564-988d-3bb0596ebc4a"
+version = "0.22.4+0"
+
+[[deps.Ghostscript_jll]]
+deps = ["Artifacts", "JLLWrappers", "JpegTurbo_jll", "Libdl", "Zlib_jll"]
+git-tree-sha1 = "38044a04637976140074d0b0621c1edf0eb531fd"
+uuid = "61579ee1-b43e-5ca0-a5da-69d92c66a64b"
+version = "9.55.1+0"
+
+[[deps.Glib_jll]]
+deps = ["Artifacts", "GettextRuntime_jll", "JLLWrappers", "Libdl", "Libffi_jll", "Libiconv_jll", "Libmount_jll", "PCRE2_jll", "Zlib_jll"]
+git-tree-sha1 = "24f6def62397474a297bfcec22384101609142ed"
+uuid = "7746bdde-850d-59dc-9ae8-88ece973131d"
+version = "2.86.3+0"
+
+[[deps.Graphite2_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "8a6dbda1fd736d60cc477d99f2e7a042acfa46e8"
+uuid = "3b182d85-2403-5c21-9c21-1e1f0cc25472"
+version = "1.3.15+0"
+
+[[deps.Grisu]]
+git-tree-sha1 = "53bb909d1151e57e2484c3d1b53e19552b887fb2"
+uuid = "42e2da0e-8278-4e71-bc24-59509adca0fe"
+version = "1.0.2"
+
+[[deps.HTTP]]
+deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
+git-tree-sha1 = "51059d23c8bb67911a2e6fd5130229113735fc7e"
+uuid = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+version = "1.11.0"
+
+[[deps.HarfBuzz_jll]]
+deps = ["Artifacts", "Cairo_jll", "Fontconfig_jll", "FreeType2_jll", "Glib_jll", "Graphite2_jll", "JLLWrappers", "Libdl", "Libffi_jll"]
+git-tree-sha1 = "f923f9a774fcf3f5cb761bfa43aeadd689714813"
+uuid = "2e76f6c2-a576-52d4-95c1-20adfe4de566"
+version = "8.5.1+0"
+
+[[deps.Hyperscript]]
+deps = ["Test"]
+git-tree-sha1 = "179267cfa5e712760cd43dcae385d7ea90cc25a4"
+uuid = "47d2ed2b-36de-50cf-bf87-49c2cf4b8b91"
+version = "0.0.5"
+
+[[deps.HypertextLiteral]]
+deps = ["Tricks"]
+git-tree-sha1 = "7134810b1afce04bbc1045ca1985fbe81ce17653"
+uuid = "ac1192a8-f4b3-4bfe-ba22-af5b92cd3ab2"
+version = "0.9.5"
+
+[[deps.IOCapture]]
+deps = ["Logging", "Random"]
+git-tree-sha1 = "b6d6bfdd7ce25b0f9b2f6b3dd56b2673a66c8770"
+uuid = "b5f81e59-6552-4d32-b1f0-c071b021bf89"
+version = "0.2.5"
+
+[[deps.InlineStrings]]
+git-tree-sha1 = "8f3d257792a522b4601c24a577954b0a8cd7334d"
+uuid = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
+version = "1.4.5"
+
+    [deps.InlineStrings.extensions]
+    ArrowTypesExt = "ArrowTypes"
+    ParsersExt = "Parsers"
+
+    [deps.InlineStrings.weakdeps]
+    ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+    Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
+
+[[deps.InteractiveUtils]]
+deps = ["Markdown"]
+uuid = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
+version = "1.11.0"
+
+[[deps.InverseFunctions]]
+git-tree-sha1 = "a779299d77cd080bf77b97535acecd73e1c5e5cb"
+uuid = "3587e190-3f89-42d0-90ee-14403ec27112"
+version = "0.1.17"
+weakdeps = ["Dates", "Test"]
+
+    [deps.InverseFunctions.extensions]
+    InverseFunctionsDatesExt = "Dates"
+    InverseFunctionsTestExt = "Test"
+
+[[deps.InvertedIndices]]
+git-tree-sha1 = "6da3c4316095de0f5ee2ebd875df8721e7e0bdbe"
+uuid = "41ab1584-1d38-5bbf-9106-f11c6c58b48f"
+version = "1.3.1"
+
+[[deps.IrrationalConstants]]
+git-tree-sha1 = "b2d91fe939cae05960e760110b328288867b5758"
+uuid = "92d709cd-6900-40b7-9082-c6be49f344b6"
+version = "0.2.6"
+
+[[deps.IteratorInterfaceExtensions]]
+git-tree-sha1 = "a3f24677c21f5bbe9d2a714f95dcd58337fb2856"
+uuid = "82899510-4779-5014-852e-03e436cf321d"
+version = "1.0.0"
+
+[[deps.JLFzf]]
+deps = ["REPL", "Random", "fzf_jll"]
+git-tree-sha1 = "82f7acdc599b65e0f8ccd270ffa1467c21cb647b"
+uuid = "1019f520-868f-41f5-a6de-eb00f4b6a39c"
+version = "0.1.11"
+
+[[deps.JLLWrappers]]
+deps = ["Artifacts", "Preferences"]
+git-tree-sha1 = "7204148362dafe5fe6a273f855b8ccbe4df8173e"
+uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
+version = "1.8.0"
+
+[[deps.JSON]]
+deps = ["Dates", "Mmap", "Parsers", "Unicode"]
+git-tree-sha1 = "31e996f0a15c7b280ba9f76636b3ff9e2ae58c9a"
+uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+version = "0.21.4"
+
+[[deps.JpegTurbo_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "c0c9b76f3520863909825cbecdef58cd63de705a"
+uuid = "aacddb02-875f-59d6-b918-886e6ef4fbf8"
+version = "3.1.5+0"
+
+[[deps.JuliaSyntaxHighlighting]]
+deps = ["StyledStrings"]
+uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
+version = "1.12.0"
+
+[[deps.LAME_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "059aabebaa7c82ccb853dd4a0ee9d17796f7e1bc"
+uuid = "c1c5ebd0-6772-5130-a774-d5fcae4a789d"
+version = "3.100.3+0"
+
+[[deps.LERC_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "17b94ecafcfa45e8360a4fc9ca6b583b049e4e37"
+uuid = "88015f11-f218-50d7-93a8-a6af411a945d"
+version = "4.1.0+0"
+
+[[deps.LLVMOpenMP_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "eb62a3deb62fc6d8822c0c4bef73e4412419c5d8"
+uuid = "1d63c593-3942-5779-bab2-d838dc0a180e"
+version = "18.1.8+0"
+
+[[deps.LaTeXStrings]]
+git-tree-sha1 = "dda21b8cbd6a6c40d9d02a73230f9d70fed6918c"
+uuid = "b964fa9f-0449-5b57-a5c2-d3ea65f4040f"
+version = "1.4.0"
+
+[[deps.Latexify]]
+deps = ["Format", "Ghostscript_jll", "InteractiveUtils", "LaTeXStrings", "MacroTools", "Markdown", "OrderedCollections", "Requires"]
+git-tree-sha1 = "44f93c47f9cd6c7e431f2f2091fcba8f01cd7e8f"
+uuid = "23fbe1c1-3f47-55db-b15f-69d7ec21a316"
+version = "0.16.10"
+
+    [deps.Latexify.extensions]
+    DataFramesExt = "DataFrames"
+    SparseArraysExt = "SparseArrays"
+    SymEngineExt = "SymEngine"
+    TectonicExt = "tectonic_jll"
+
+    [deps.Latexify.weakdeps]
+    DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+    SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+    SymEngine = "123dc426-2d89-5057-bbad-38513e3affd8"
+    tectonic_jll = "d7dd28d6-a5e6-559c-9131-7eb760cdacc5"
+
+[[deps.LibCURL]]
+deps = ["LibCURL_jll", "MozillaCACerts_jll"]
+uuid = "b27032c2-a3e7-50c8-80cd-2d36dbcbfd21"
+version = "0.6.4"
+
+[[deps.LibCURL_jll]]
+deps = ["Artifacts", "LibSSH2_jll", "Libdl", "OpenSSL_jll", "Zlib_jll", "nghttp2_jll"]
+uuid = "deac9b47-8bc7-5906-a0fe-35ac56dc84c0"
+version = "8.15.0+0"
+
+[[deps.LibGit2]]
+deps = ["LibGit2_jll", "NetworkOptions", "Printf", "SHA"]
+uuid = "76f85450-5226-5b5a-8eaa-529ad045b433"
+version = "1.11.0"
+
+[[deps.LibGit2_jll]]
+deps = ["Artifacts", "LibSSH2_jll", "Libdl", "OpenSSL_jll"]
+uuid = "e37daf67-58a4-590a-8e99-b0245dd2ffc5"
+version = "1.9.0+0"
+
+[[deps.LibSSH2_jll]]
+deps = ["Artifacts", "Libdl", "OpenSSL_jll"]
+uuid = "29816b5a-b9ab-546f-933c-edad1886dfa8"
+version = "1.11.3+1"
+
+[[deps.Libdl]]
+uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+version = "1.11.0"
+
+[[deps.Libffi_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "c8da7e6a91781c41a863611c7e966098d783c57a"
+uuid = "e9f186c6-92d2-5b65-8a66-fee21dc1b490"
+version = "3.4.7+0"
+
+[[deps.Libglvnd_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libX11_jll", "Xorg_libXext_jll"]
+git-tree-sha1 = "d36c21b9e7c172a44a10484125024495e2625ac0"
+uuid = "7e76a0d4-f3c7-5321-8279-8d96eeed0f29"
+version = "1.7.1+1"
+
+[[deps.Libiconv_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "be484f5c92fad0bd8acfef35fe017900b0b73809"
+uuid = "94ce4f54-9a6c-5748-9c1c-f9c7231a4531"
+version = "1.18.0+0"
+
+[[deps.Libmount_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "cc3ad4faf30015a3e8094c9b5b7f19e85bdf2386"
+uuid = "4b2f31a3-9ecc-558c-b454-b3730dcb73e9"
+version = "2.42.0+0"
+
+[[deps.Libtiff_jll]]
+deps = ["Artifacts", "JLLWrappers", "JpegTurbo_jll", "LERC_jll", "Libdl", "XZ_jll", "Zlib_jll", "Zstd_jll"]
+git-tree-sha1 = "f04133fe05eff1667d2054c53d59f9122383fe05"
+uuid = "89763e89-9b03-5906-acba-b20f662cd828"
+version = "4.7.2+0"
+
+[[deps.Libuuid_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "d620582b1f0cbe2c72dd1d5bd195a9ce73370ab1"
+uuid = "38a345b3-de98-5d2b-a5d3-14cd9215e700"
+version = "2.42.0+0"
+
+[[deps.LinearAlgebra]]
+deps = ["Libdl", "OpenBLAS_jll", "libblastrampoline_jll"]
+uuid = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+version = "1.12.0"
+
+[[deps.LogExpFunctions]]
+deps = ["DocStringExtensions", "IrrationalConstants", "LinearAlgebra"]
+git-tree-sha1 = "13ca9e2586b89836fd20cccf56e57e2b9ae7f38f"
+uuid = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+version = "0.3.29"
+
+    [deps.LogExpFunctions.extensions]
+    LogExpFunctionsChainRulesCoreExt = "ChainRulesCore"
+    LogExpFunctionsChangesOfVariablesExt = "ChangesOfVariables"
+    LogExpFunctionsInverseFunctionsExt = "InverseFunctions"
+
+    [deps.LogExpFunctions.weakdeps]
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    ChangesOfVariables = "9e997f8a-9a97-42d5-a9f1-ce6bfc15e2c0"
+    InverseFunctions = "3587e190-3f89-42d0-90ee-14403ec27112"
+
+[[deps.Logging]]
+uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
+version = "1.11.0"
+
+[[deps.LoggingExtras]]
+deps = ["Dates", "Logging"]
+git-tree-sha1 = "f00544d95982ea270145636c181ceda21c4e2575"
+uuid = "e6f89c97-d47a-5376-807f-9c37f3926c36"
+version = "1.2.0"
+
+[[deps.MIMEs]]
+git-tree-sha1 = "c64d943587f7187e751162b3b84445bbbd79f691"
+uuid = "6c6e2e6c-3030-632d-7369-2d6c69616d65"
+version = "1.1.0"
+
+[[deps.MacroTools]]
+git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
+uuid = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
+version = "0.5.16"
+
+[[deps.Markdown]]
+deps = ["Base64", "JuliaSyntaxHighlighting", "StyledStrings"]
+uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
+version = "1.11.0"
+
+[[deps.MbedTLS]]
+deps = ["Dates", "MbedTLS_jll", "MozillaCACerts_jll", "NetworkOptions", "Random", "Sockets"]
+git-tree-sha1 = "8785729fa736197687541f7053f6d8ab7fc44f92"
+uuid = "739be429-bea8-5141-9913-cc70e7f3736d"
+version = "1.1.10"
+
+[[deps.MbedTLS_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "ff69a2b1330bcb730b9ac1ab7dd680176f5896b8"
+uuid = "c8ffd9c3-330d-5841-b78e-0817d7145fa1"
+version = "2.28.1010+0"
+
+[[deps.Measures]]
+git-tree-sha1 = "b513cedd20d9c914783d8ad83d08120702bf2c77"
+uuid = "442fdcdd-2543-5da2-b0f3-8c86c306513e"
+version = "0.3.3"
+
+[[deps.Missings]]
+deps = ["DataAPI"]
+git-tree-sha1 = "ec4f7fbeab05d7747bdf98eb74d130a2a2ed298d"
+uuid = "e1d29d7a-bbdc-5cf2-9ac0-f12de2c33e28"
+version = "1.2.0"
+
+[[deps.Mmap]]
+uuid = "a63ad114-7e13-5084-954f-fe012c677804"
+version = "1.11.0"
+
+[[deps.MozillaCACerts_jll]]
+uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
+version = "2025.11.4"
+
+[[deps.NaNMath]]
+deps = ["OpenLibm_jll"]
+git-tree-sha1 = "9b8215b1ee9e78a293f99797cd31375471b2bcae"
+uuid = "77ba4419-2d1f-58cd-9bb1-8ffee604a2e3"
+version = "1.1.3"
+
+[[deps.NetworkOptions]]
+uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
+version = "1.3.0"
+
+[[deps.Ogg_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "b6aa4566bb7ae78498a5e68943863fa8b5231b59"
+uuid = "e7412a2a-1a6e-54c0-be00-318e2571c051"
+version = "1.3.6+0"
+
+[[deps.OpenBLAS_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
+uuid = "4536629a-c528-5b80-bd46-f80d51c5b363"
+version = "0.3.29+0"
+
+[[deps.OpenLibm_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "05823500-19ac-5b8b-9628-191a04bc5112"
+version = "0.8.7+0"
+
+[[deps.OpenSSL]]
+deps = ["BitFlags", "Dates", "MozillaCACerts_jll", "NetworkOptions", "OpenSSL_jll", "Sockets"]
+git-tree-sha1 = "1d1aaa7d449b58415f97d2839c318b70ffb525a0"
+uuid = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
+version = "1.6.1"
+
+[[deps.OpenSSL_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "458c3c95-2e84-50aa-8efc-19380b2a3a95"
+version = "3.5.4+0"
+
+[[deps.Opus_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "e2bb57a313a74b8104064b7efd01406c0a50d2ff"
+uuid = "91d4177d-7536-5919-b921-800302f37372"
+version = "1.6.1+0"
+
+[[deps.OrderedCollections]]
+git-tree-sha1 = "05868e21324cede2207c6f0f466b4bfef6d5e7ee"
+uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+version = "1.8.1"
+
+[[deps.PCRE2_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "efcefdf7-47ab-520b-bdef-62a2eaa19f15"
+version = "10.44.0+1"
+
+[[deps.Pango_jll]]
+deps = ["Artifacts", "Cairo_jll", "Fontconfig_jll", "FreeType2_jll", "FriBidi_jll", "Glib_jll", "HarfBuzz_jll", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "58e5ed5e386e156bd93e86b305ebd21ac63d2d04"
+uuid = "36c8627f-9965-5494-a995-c6b170f724f3"
+version = "1.57.1+0"
+
+[[deps.Parsers]]
+deps = ["Dates", "PrecompileTools", "UUIDs"]
+git-tree-sha1 = "5d5e0a78e971354b1c7bff0655d11fdc1b0e12c8"
+uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
+version = "2.8.4"
+
+[[deps.Pixman_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LLVMOpenMP_jll", "Libdl"]
+git-tree-sha1 = "e4a6721aa89e62e5d4217c0b21bd714263779dda"
+uuid = "30392449-352a-5448-841d-b1acce4e97dc"
+version = "0.46.4+0"
+
+[[deps.Pkg]]
+deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
+uuid = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+version = "1.12.1"
+weakdeps = ["REPL"]
+
+    [deps.Pkg.extensions]
+    REPLExt = "REPL"
+
+[[deps.PlotThemes]]
+deps = ["PlotUtils", "Statistics"]
+git-tree-sha1 = "41031ef3a1be6f5bbbf3e8073f210556daeae5ca"
+uuid = "ccf2f8ad-2431-5c83-bf29-c5338b663b6a"
+version = "3.3.0"
+
+[[deps.PlotUtils]]
+deps = ["ColorSchemes", "Colors", "Dates", "PrecompileTools", "Printf", "Random", "Reexport", "StableRNGs", "Statistics"]
+git-tree-sha1 = "26ca162858917496748aad52bb5d3be4d26a228a"
+uuid = "995b91a9-d308-5afd-9ec6-746e21dbc043"
+version = "1.4.4"
+
+[[deps.Plots]]
+deps = ["Base64", "Contour", "Dates", "Downloads", "FFMPEG", "FixedPointNumbers", "GR", "JLFzf", "JSON", "LaTeXStrings", "Latexify", "LinearAlgebra", "Measures", "NaNMath", "Pkg", "PlotThemes", "PlotUtils", "PrecompileTools", "Printf", "REPL", "Random", "RecipesBase", "RecipesPipeline", "Reexport", "RelocatableFolders", "Requires", "Scratch", "Showoff", "SparseArrays", "Statistics", "StatsBase", "TOML", "UUIDs", "UnicodeFun", "Unzip"]
+git-tree-sha1 = "cb20a4eacda080e517e4deb9cfb6c7c518131265"
+uuid = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+version = "1.41.6"
+
+    [deps.Plots.extensions]
+    FileIOExt = "FileIO"
+    GeometryBasicsExt = "GeometryBasics"
+    IJuliaExt = "IJulia"
+    ImageInTerminalExt = "ImageInTerminal"
+    UnitfulExt = "Unitful"
+
+    [deps.Plots.weakdeps]
+    FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+    GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
+    IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
+    ImageInTerminal = "d8c32880-2388-543b-8c61-d9f865259254"
+    Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[[deps.PlutoUI]]
+deps = ["AbstractPlutoDingetjes", "Base64", "ColorTypes", "Dates", "FixedPointNumbers", "Hyperscript", "HypertextLiteral", "IOCapture", "InteractiveUtils", "JSON", "Logging", "MIMEs", "Markdown", "Random", "Reexport", "URIs", "UUIDs"]
+git-tree-sha1 = "7e71a55b87222942f0f9337be62e26b1f103d3e4"
+uuid = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+version = "0.7.61"
+
+[[deps.PooledArrays]]
+deps = ["DataAPI", "Future"]
+git-tree-sha1 = "36d8b4b899628fb92c2749eb488d884a926614d3"
+uuid = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
+version = "1.4.3"
+
+[[deps.PrecompileTools]]
+deps = ["Preferences"]
+git-tree-sha1 = "edbeefc7a4889f528644251bdb5fc9ab5348bc2c"
+uuid = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+version = "1.3.4"
+
+[[deps.Preferences]]
+deps = ["TOML"]
+git-tree-sha1 = "8b770b60760d4451834fe79dd483e318eee709c4"
+uuid = "21216c6a-2e73-6563-6e65-726566657250"
+version = "1.5.2"
+
+[[deps.PrettyTables]]
+deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "Tables"]
+git-tree-sha1 = "624de6279ab7d94fc9f672f0068107eb6619732c"
+uuid = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
+version = "3.3.2"
+
+    [deps.PrettyTables.extensions]
+    PrettyTablesTypstryExt = "Typstry"
+
+    [deps.PrettyTables.weakdeps]
+    Typstry = "f0ed7684-a786-439e-b1e3-3b82803b501e"
+
+[[deps.Printf]]
+deps = ["Unicode"]
+uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+version = "1.11.0"
+
+[[deps.PtrArrays]]
+git-tree-sha1 = "4fbbafbc6251b883f4d2705356f3641f3652a7fe"
+uuid = "43287f4e-b6f4-7ad1-bb20-aadabca52c3d"
+version = "1.4.0"
+
+[[deps.Qt6Base_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "Fontconfig_jll", "Glib_jll", "JLLWrappers", "Libdl", "Libglvnd_jll", "OpenSSL_jll", "Vulkan_Loader_jll", "Xorg_libSM_jll", "Xorg_libXext_jll", "Xorg_libXrender_jll", "Xorg_libxcb_jll", "Xorg_xcb_util_cursor_jll", "Xorg_xcb_util_image_jll", "Xorg_xcb_util_keysyms_jll", "Xorg_xcb_util_renderutil_jll", "Xorg_xcb_util_wm_jll", "Zlib_jll", "libinput_jll", "xkbcommon_jll"]
+git-tree-sha1 = "144895f6166994730ee7ff8113b981fc360638f1"
+uuid = "c0090381-4147-56d7-9ebc-da0b1113ec56"
+version = "6.10.2+2"
+
+[[deps.Qt6Declarative_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Qt6Base_jll", "Qt6ShaderTools_jll", "Qt6Svg_jll"]
+git-tree-sha1 = "d5b7dd0e226774cbd87e2790e34def09245c7eab"
+uuid = "629bc702-f1f5-5709-abd5-49b8460ea067"
+version = "6.10.2+1"
+
+[[deps.Qt6ShaderTools_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Qt6Base_jll"]
+git-tree-sha1 = "4d85eedf69d875982c46643f6b4f66919d7e157b"
+uuid = "ce943373-25bb-56aa-8eca-768745ed7b5a"
+version = "6.10.2+1"
+
+[[deps.Qt6Svg_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Qt6Base_jll"]
+git-tree-sha1 = "81587ff5ff25a4e1115ce191e36285ede0334c9d"
+uuid = "6de9746b-f93d-5813-b365-ba18ad4a9cf3"
+version = "6.10.2+0"
+
+[[deps.Qt6Wayland_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Qt6Base_jll", "Qt6Declarative_jll"]
+git-tree-sha1 = "672c938b4b4e3e0169a07a5f227029d4905456f2"
+uuid = "e99dba38-086e-5de3-a5b1-6e4c66e897c3"
+version = "6.10.2+1"
+
+[[deps.QuadGK]]
+deps = ["DataStructures", "LinearAlgebra"]
+git-tree-sha1 = "5e8e8b0ab68215d7a2b14b9921a946fee794749e"
+uuid = "1fd47b50-473d-5c70-9696-f719f8f3bcdc"
+version = "2.11.3"
+
+    [deps.QuadGK.extensions]
+    QuadGKEnzymeExt = "Enzyme"
+
+    [deps.QuadGK.weakdeps]
+    Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+
+[[deps.REPL]]
+deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
+uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+version = "1.11.0"
+
+[[deps.Random]]
+deps = ["SHA"]
+uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+version = "1.11.0"
+
+[[deps.RecipesBase]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "5c3d09cc4f31f5fc6af001c250bf1278733100ff"
+uuid = "3cdcf5f2-1ef4-517c-9805-6587b60abb01"
+version = "1.3.4"
+
+[[deps.RecipesPipeline]]
+deps = ["Dates", "NaNMath", "PlotUtils", "PrecompileTools", "RecipesBase"]
+git-tree-sha1 = "45cf9fd0ca5839d06ef333c8201714e888486342"
+uuid = "01d81517-befc-4cb6-b9ec-a95719d0359c"
+version = "0.6.12"
+
+[[deps.Reexport]]
+git-tree-sha1 = "45e428421666073eab6f2da5c9d310d99bb12f9b"
+uuid = "189a3867-3050-52da-a836-e630ba90ab69"
+version = "1.2.2"
+
+[[deps.RelocatableFolders]]
+deps = ["SHA", "Scratch"]
+git-tree-sha1 = "ffdaf70d81cf6ff22c2b6e733c900c3321cab864"
+uuid = "05181044-ff0b-4ac5-8273-598c1e38db00"
+version = "1.0.1"
+
+[[deps.Requires]]
+deps = ["UUIDs"]
+git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
+uuid = "ae029012-a4dd-5104-9daa-d747884805df"
+version = "1.3.1"
+
+[[deps.Roots]]
+deps = ["Accessors", "CommonSolve", "Printf"]
+git-tree-sha1 = "8a433b1ede5e9be9a7ba5b1cc6698daa8d718f1d"
+uuid = "f2b01f46-fcfa-551c-844a-d8ac1e96c665"
+version = "2.2.10"
+
+    [deps.Roots.extensions]
+    RootsChainRulesCoreExt = "ChainRulesCore"
+    RootsForwardDiffExt = "ForwardDiff"
+    RootsIntervalRootFindingExt = "IntervalRootFinding"
+    RootsSymPyExt = "SymPy"
+    RootsSymPyPythonCallExt = "SymPyPythonCall"
+    RootsUnitfulExt = "Unitful"
+
+    [deps.Roots.weakdeps]
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+    IntervalRootFinding = "d2bf35a9-74e0-55ec-b149-d360ff49b807"
+    SymPy = "24249f21-da20-56a4-8eb1-6a02cf4ae2e6"
+    SymPyPythonCall = "bc8888f7-b21e-4b7c-a06a-5d9c9496438c"
+    Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[[deps.SHA]]
+uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+version = "0.7.0"
+
+[[deps.Scratch]]
+deps = ["Dates"]
+git-tree-sha1 = "9b81b8393e50b7d4e6d0a9f14e192294d3b7c109"
+uuid = "6c6a2e73-6563-6170-7368-637461726353"
+version = "1.3.0"
+
+[[deps.SentinelArrays]]
+deps = ["Dates", "Random"]
+git-tree-sha1 = "084c47c7c5ce5cfecefa0a98dff69eb3646b5a80"
+uuid = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
+version = "1.4.10"
+
+[[deps.Serialization]]
+uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+version = "1.11.0"
+
+[[deps.Showoff]]
+deps = ["Dates", "Grisu"]
+git-tree-sha1 = "91eddf657aca81df9ae6ceb20b959ae5653ad1de"
+uuid = "992d4aef-0814-514b-bc4d-f2e9a6c4116f"
+version = "1.0.3"
+
+[[deps.SimpleBufferStream]]
+git-tree-sha1 = "f305871d2f381d21527c770d4788c06c097c9bc1"
+uuid = "777ac1f9-54b0-4bf8-805c-2214025038e7"
+version = "1.2.0"
+
+[[deps.Sockets]]
+uuid = "6462fe0b-24de-5631-8697-dd941f90decc"
+version = "1.11.0"
+
+[[deps.SortingAlgorithms]]
+deps = ["DataStructures"]
+git-tree-sha1 = "64d974c2e6fdf07f8155b5b2ca2ffa9069b608d9"
+uuid = "a2af1166-a08f-5f64-846c-94a0d3cef48c"
+version = "1.2.2"
+
+[[deps.SparseArrays]]
+deps = ["Libdl", "LinearAlgebra", "Random", "Serialization", "SuiteSparse_jll"]
+uuid = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+version = "1.12.0"
+
+[[deps.StableRNGs]]
+deps = ["Random"]
+git-tree-sha1 = "4f96c596b8c8258cc7d3b19797854d368f243ddc"
+uuid = "860ef19b-820b-49d6-a774-d7a799459cd3"
+version = "1.0.4"
+
+[[deps.Statistics]]
+deps = ["LinearAlgebra"]
+git-tree-sha1 = "ae3bb1eb3bba077cd276bc5cfc337cc65c3075c0"
+uuid = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+version = "1.11.1"
+weakdeps = ["SparseArrays"]
+
+    [deps.Statistics.extensions]
+    SparseArraysExt = ["SparseArrays"]
+
+[[deps.StatsAPI]]
+deps = ["LinearAlgebra"]
+git-tree-sha1 = "178ed29fd5b2a2cfc3bd31c13375ae925623ff36"
+uuid = "82ae8749-77ed-4fe6-ae5f-f523153014b0"
+version = "1.8.0"
+
+[[deps.StatsBase]]
+deps = ["AliasTables", "DataAPI", "DataStructures", "IrrationalConstants", "LinearAlgebra", "LogExpFunctions", "Missings", "Printf", "Random", "SortingAlgorithms", "SparseArrays", "Statistics", "StatsAPI"]
+git-tree-sha1 = "aceda6f4e598d331548e04cc6b2124a6148138e3"
+uuid = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+version = "0.34.10"
+
+[[deps.StringManipulation]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "d05693d339e37d6ab134c5ab53c29fce5ee5d7d5"
+uuid = "892a3eda-7b42-436c-8928-eab12a02cf0e"
+version = "0.4.4"
+
+[[deps.StyledStrings]]
+uuid = "f489334b-da3d-4c2e-b8f0-e476e12c162b"
+version = "1.11.0"
+
+[[deps.SuiteSparse_jll]]
+deps = ["Artifacts", "Libdl", "libblastrampoline_jll"]
+uuid = "bea87d4a-7f5b-5778-9afe-8cc45184846c"
+version = "7.8.3+2"
+
+[[deps.TOML]]
+deps = ["Dates"]
+uuid = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+version = "1.0.3"
+
+[[deps.TableTraits]]
+deps = ["IteratorInterfaceExtensions"]
+git-tree-sha1 = "c06b2f539df1c6efa794486abfb6ed2022561a39"
+uuid = "3783bdb8-4a98-5b6b-af9a-565f29a5fe9c"
+version = "1.0.1"
+
+[[deps.Tables]]
+deps = ["DataAPI", "DataValueInterfaces", "IteratorInterfaceExtensions", "OrderedCollections", "TableTraits"]
+git-tree-sha1 = "f2c1efbc8f3a609aadf318094f8fc5204bdaf344"
+uuid = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+version = "1.12.1"
+
+[[deps.Tar]]
+deps = ["ArgTools", "SHA"]
+uuid = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
+version = "1.10.0"
+
+[[deps.TensorCore]]
+deps = ["LinearAlgebra"]
+git-tree-sha1 = "1feb45f88d133a655e001435632f019a9a1bcdb6"
+uuid = "62fd8b95-f654-4bbd-a8a5-9c27f68ccd50"
+version = "0.1.1"
+
+[[deps.Test]]
+deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
+uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+version = "1.11.0"
+
+[[deps.TranscodingStreams]]
+git-tree-sha1 = "0c45878dcfdcfa8480052b6ab162cdd138781742"
+uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
+version = "0.11.3"
+
+[[deps.Tricks]]
+git-tree-sha1 = "311349fd1c93a31f783f977a71e8b062a57d4101"
+uuid = "410a4b4d-49e4-4fbc-ab6d-cb71b17b3775"
+version = "0.1.13"
+
+[[deps.URIs]]
+git-tree-sha1 = "bef26fb046d031353ef97a82e3fdb6afe7f21b1a"
+uuid = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
+version = "1.6.1"
+
+[[deps.UUIDs]]
+deps = ["Random", "SHA"]
+uuid = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+version = "1.11.0"
+
+[[deps.Unicode]]
+uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
+version = "1.11.0"
+
+[[deps.UnicodeFun]]
+deps = ["REPL"]
+git-tree-sha1 = "53915e50200959667e78a92a418594b428dffddf"
+uuid = "1cfade01-22cf-5700-b092-accc4b62d6e1"
+version = "0.4.1"
+
+[[deps.Unzip]]
+git-tree-sha1 = "ca0969166a028236229f63514992fc073799bb78"
+uuid = "41fe7b60-77ed-43a1-b4f0-825fd5a5650d"
+version = "0.2.0"
+
+[[deps.Vulkan_Loader_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Wayland_jll", "Xorg_libX11_jll", "Xorg_libXrandr_jll", "xkbcommon_jll"]
+git-tree-sha1 = "2f0486047a07670caad3a81a075d2e518acc5c59"
+uuid = "a44049a8-05dd-5a78-86c9-5fde0876e88c"
+version = "1.3.243+0"
+
+[[deps.Wayland_jll]]
+deps = ["Artifacts", "EpollShim_jll", "Expat_jll", "JLLWrappers", "Libdl", "Libffi_jll"]
+git-tree-sha1 = "96478df35bbc2f3e1e791bc7a3d0eeee559e60e9"
+uuid = "a2964d1f-97da-50d4-b82a-358c7fce9d89"
+version = "1.24.0+0"
+
+[[deps.XZ_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "b29c22e245d092b8b4e8d3c09ad7baa586d9f573"
+uuid = "ffd25f8a-64ca-5728-b0f7-c24cf3aae800"
+version = "5.8.3+0"
+
+[[deps.Xorg_libICE_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "a3ea76ee3f4facd7a64684f9af25310825ee3668"
+uuid = "f67eecfb-183a-506d-b269-f58e52b52d7c"
+version = "1.1.2+0"
+
+[[deps.Xorg_libSM_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libICE_jll"]
+git-tree-sha1 = "9c7ad99c629a44f81e7799eb05ec2746abb5d588"
+uuid = "c834827a-8449-5923-a945-d239c165b7dd"
+version = "1.2.6+0"
+
+[[deps.Xorg_libX11_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libxcb_jll", "Xorg_xtrans_jll"]
+git-tree-sha1 = "808090ede1d41644447dd5cbafced4731c56bd2f"
+uuid = "4f6342f7-b3d2-589e-9d20-edeb45f2b2bc"
+version = "1.8.13+0"
+
+[[deps.Xorg_libXau_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "aa1261ebbac3ccc8d16558ae6799524c450ed16b"
+uuid = "0c0b7dd1-d40b-584c-a123-a41640f87eec"
+version = "1.0.13+0"
+
+[[deps.Xorg_libXcursor_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libXfixes_jll", "Xorg_libXrender_jll"]
+git-tree-sha1 = "6c74ca84bbabc18c4547014765d194ff0b4dc9da"
+uuid = "935fb764-8cf2-53bf-bb30-45bb1f8bf724"
+version = "1.2.4+0"
+
+[[deps.Xorg_libXdmcp_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "52858d64353db33a56e13c341d7bf44cd0d7b309"
+uuid = "a3789734-cfe1-5b06-b2d0-1dd0d9d62d05"
+version = "1.1.6+0"
+
+[[deps.Xorg_libXext_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libX11_jll"]
+git-tree-sha1 = "1a4a26870bf1e5d26cd585e38038d399d7e65706"
+uuid = "1082639a-0dae-5f34-9b06-72781eeb8cb3"
+version = "1.3.8+0"
+
+[[deps.Xorg_libXfixes_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libX11_jll"]
+git-tree-sha1 = "75e00946e43621e09d431d9b95818ee751e6b2ef"
+uuid = "d091e8ba-531a-589c-9de9-94069b037ed8"
+version = "6.0.2+0"
+
+[[deps.Xorg_libXi_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libXext_jll", "Xorg_libXfixes_jll"]
+git-tree-sha1 = "a376af5c7ae60d29825164db40787f15c80c7c54"
+uuid = "a51aa0fd-4e3c-5386-b890-e753decda492"
+version = "1.8.3+0"
+
+[[deps.Xorg_libXinerama_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libXext_jll"]
+git-tree-sha1 = "0ba01bc7396896a4ace8aab67db31403c71628f4"
+uuid = "d1454406-59df-5ea1-beac-c340f2130bc3"
+version = "1.1.7+0"
+
+[[deps.Xorg_libXrandr_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libXext_jll", "Xorg_libXrender_jll"]
+git-tree-sha1 = "6c174ef70c96c76f4c3f4d3cfbe09d018bcd1b53"
+uuid = "ec84b674-ba8e-5d96-8ba1-2a689ba10484"
+version = "1.5.6+0"
+
+[[deps.Xorg_libXrender_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libX11_jll"]
+git-tree-sha1 = "7ed9347888fac59a618302ee38216dd0379c480d"
+uuid = "ea2f1a96-1ddc-540d-b46f-429655e07cfa"
+version = "0.9.12+0"
+
+[[deps.Xorg_libpciaccess_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Zlib_jll"]
+git-tree-sha1 = "58972370b81423fc546c56a60ed1a009450177c3"
+uuid = "a65dc6b1-eb27-53a1-bb3e-dea574b5389e"
+version = "0.19.0+0"
+
+[[deps.Xorg_libxcb_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libXau_jll", "Xorg_libXdmcp_jll"]
+git-tree-sha1 = "bfcaf7ec088eaba362093393fe11aa141fa15422"
+uuid = "c7cfdc94-dc32-55de-ac96-5a1b8d977c5b"
+version = "1.17.1+0"
+
+[[deps.Xorg_libxkbfile_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libX11_jll"]
+git-tree-sha1 = "ed756a03e95fff88d8f738ebc2849431bdd4fd1a"
+uuid = "cc61e674-0454-545c-8b26-ed2c68acab7a"
+version = "1.2.0+0"
+
+[[deps.Xorg_xcb_util_cursor_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_xcb_util_image_jll", "Xorg_xcb_util_jll", "Xorg_xcb_util_renderutil_jll"]
+git-tree-sha1 = "9750dc53819eba4e9a20be42349a6d3b86c7cdf8"
+uuid = "e920d4aa-a673-5f3a-b3d7-f755a4d47c43"
+version = "0.1.6+0"
+
+[[deps.Xorg_xcb_util_image_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_xcb_util_jll"]
+git-tree-sha1 = "f4fc02e384b74418679983a97385644b67e1263b"
+uuid = "12413925-8142-5f55-bb0e-6d7ca50bb09b"
+version = "0.4.1+0"
+
+[[deps.Xorg_xcb_util_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libxcb_jll"]
+git-tree-sha1 = "68da27247e7d8d8dafd1fcf0c3654ad6506f5f97"
+uuid = "2def613f-5ad1-5310-b15b-b15d46f528f5"
+version = "0.4.1+0"
+
+[[deps.Xorg_xcb_util_keysyms_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_xcb_util_jll"]
+git-tree-sha1 = "44ec54b0e2acd408b0fb361e1e9244c60c9c3dd4"
+uuid = "975044d2-76e6-5fbe-bf08-97ce7c6574c7"
+version = "0.4.1+0"
+
+[[deps.Xorg_xcb_util_renderutil_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_xcb_util_jll"]
+git-tree-sha1 = "5b0263b6d080716a02544c55fdff2c8d7f9a16a0"
+uuid = "0d47668e-0667-5a69-a72c-f761630bfb7e"
+version = "0.3.10+0"
+
+[[deps.Xorg_xcb_util_wm_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_xcb_util_jll"]
+git-tree-sha1 = "f233c83cad1fa0e70b7771e0e21b061a116f2763"
+uuid = "c22f9ab0-d5fe-5066-847c-f4bb1cd4e361"
+version = "0.4.2+0"
+
+[[deps.Xorg_xkbcomp_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libxkbfile_jll"]
+git-tree-sha1 = "801a858fc9fb90c11ffddee1801bb06a738bda9b"
+uuid = "35661453-b289-5fab-8a00-3d9160c6a3a4"
+version = "1.4.7+0"
+
+[[deps.Xorg_xkeyboard_config_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_xkbcomp_jll"]
+git-tree-sha1 = "ed349d26affcacafbc7fc2941ace1fb98f71e715"
+uuid = "33bec58e-1273-512f-9401-5d533626f822"
+version = "2.47.0+1"
+
+[[deps.Xorg_xtrans_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "a63799ff68005991f9d9491b6e95bd3478d783cb"
+uuid = "c5fb5394-a638-5e4d-96e5-b29de1b5cf10"
+version = "1.6.0+0"
+
+[[deps.Zlib_jll]]
+deps = ["Libdl"]
+uuid = "83775a58-1f1d-513f-b197-d71354ab007a"
+version = "1.3.1+2"
+
+[[deps.Zstd_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "446b23e73536f84e8037f5dce465e92275f6a308"
+uuid = "3161d3a3-bdf6-5164-811a-617609db77b4"
+version = "1.5.7+1"
+
+[[deps.eudev_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "c3b0e6196d50eab0c5ed34021aaa0bb463489510"
+uuid = "35ca27e7-8b34-5b7f-bca9-bdc33f59eb06"
+version = "3.2.14+0"
+
+[[deps.fzf_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "b6a34e0e0960190ac2a4363a1bd003504772d631"
+uuid = "214eeab7-80f7-51ab-84ad-2988db7cef09"
+version = "0.61.1+0"
+
+[[deps.libaom_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "850b06095ee71f0135d644ffd8a52850699581ed"
+uuid = "a4ae2306-e953-59d6-aa16-d00cac43593b"
+version = "3.13.3+0"
+
+[[deps.libass_jll]]
+deps = ["Artifacts", "Bzip2_jll", "FreeType2_jll", "FriBidi_jll", "HarfBuzz_jll", "JLLWrappers", "Libdl", "Zlib_jll"]
+git-tree-sha1 = "125eedcb0a4a0bba65b657251ce1d27c8714e9d6"
+uuid = "0ac62f75-1d6f-5e53-bd7c-93b484bb37c0"
+version = "0.17.4+0"
+
+[[deps.libblastrampoline_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "8e850b90-86db-534c-a0d3-1478176c7d93"
+version = "5.15.0+0"
+
+[[deps.libdecor_jll]]
+deps = ["Artifacts", "Dbus_jll", "JLLWrappers", "Libdl", "Libglvnd_jll", "Pango_jll", "Wayland_jll", "xkbcommon_jll"]
+git-tree-sha1 = "9bf7903af251d2050b467f76bdbe57ce541f7f4f"
+uuid = "1183f4f0-6f2a-5f1a-908b-139f9cdfea6f"
+version = "0.2.2+0"
+
+[[deps.libdrm_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libpciaccess_jll"]
+git-tree-sha1 = "63aac0bcb0b582e11bad965cef4a689905456c03"
+uuid = "8e53e030-5e6c-5a89-a30b-be5b7263a166"
+version = "2.4.125+1"
+
+[[deps.libevdev_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "56d643b57b188d30cccc25e331d416d3d358e557"
+uuid = "2db6ffa8-e38f-5e21-84af-90c45d0032cc"
+version = "1.13.4+0"
+
+[[deps.libfdk_aac_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "646634dd19587a56ee2f1199563ec056c5f228df"
+uuid = "f638f0a6-7fb0-5443-88ba-1cc74229b280"
+version = "2.0.4+0"
+
+[[deps.libinput_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "eudev_jll", "libevdev_jll", "mtdev_jll"]
+git-tree-sha1 = "91d05d7f4a9f67205bd6cf395e488009fe85b499"
+uuid = "36db933b-70db-51c0-b978-0f229ee0e533"
+version = "1.28.1+0"
+
+[[deps.libpng_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Zlib_jll"]
+git-tree-sha1 = "e51150d5ab85cee6fc36726850f0e627ad2e4aba"
+uuid = "b53b4c65-9356-5827-b1ea-8c7a1a84506f"
+version = "1.6.58+0"
+
+[[deps.libva_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libX11_jll", "Xorg_libXext_jll", "Xorg_libXfixes_jll", "libdrm_jll"]
+git-tree-sha1 = "7dbf96baae3310fe2fa0df0ccbb3c6288d5816c9"
+uuid = "9a156e7d-b971-5f62-b2c9-67348b8fb97c"
+version = "2.23.0+0"
+
+[[deps.libvorbis_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Ogg_jll"]
+git-tree-sha1 = "11e1772e7f3cc987e9d3de991dd4f6b2602663a5"
+uuid = "f27f6e37-5d2b-51aa-960f-b287f2bc3b7a"
+version = "1.3.8+0"
+
+[[deps.mtdev_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "b4d631fd51f2e9cdd93724ae25b2efc198b059b1"
+uuid = "009596ad-96f7-51b1-9f1b-5ce2d5e8a71e"
+version = "1.1.7+0"
+
+[[deps.nghttp2_jll]]
+deps = ["Artifacts", "Libdl"]
+uuid = "8e850ede-7688-5339-a07c-302acd2aaf8d"
+version = "1.64.0+1"
+
+[[deps.p7zip_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
+uuid = "3f19e933-33d8-53b3-aaab-bd5110c3b7a0"
+version = "17.7.0+0"
+
+[[deps.x264_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "14cc7083fc6dff3cc44f2bc435ee96d06ed79aa7"
+uuid = "1270edf5-f2f9-52d2-97e9-ab00b5d0237a"
+version = "10164.0.1+0"
+
+[[deps.x265_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "e7b67590c14d487e734dcb925924c5dc43ec85f3"
+uuid = "dfaa095f-4041-5dcd-9319-2fabd8486b76"
+version = "4.1.0+0"
+
+[[deps.xkbcommon_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libxcb_jll", "Xorg_xkeyboard_config_jll"]
+git-tree-sha1 = "a1fc6507a40bf504527d0d4067d718f8e179b2b8"
+uuid = "d8fb68d0-12a3-5cfd-a85a-d49703b185fd"
+version = "1.13.0+0"
+"""
+
+# ╔═╡ Cell order:
+# ╠═750040b4-5c78-11f1-86ff-57f7a95bfe26
+# ╟─7500415e-5c78-11f1-9f35-a1b8723f361c
+# ╠═75004352-5c78-11f1-840e-f94b7b0cb952
+# ╟─750047a6-5c78-11f1-b0f5-a3e227c6c8b9
+# ╟─750049ec-5c78-11f1-a424-355252dfd23f
+# ╟─75004b22-5c78-11f1-acf0-7b11d63751b1
+# ╟─75004c26-5c78-11f1-8f7c-29928c62cbd8
+# ╟─75004cf8-5c78-11f1-8454-c95a65b074db
+# ╠═75004dfc-5c78-11f1-8224-05b6784be610
+# ╠═75004f0a-5c78-11f1-8801-b529eb9a8616
+# ╠═19311ee4-6a9e-4f44-81fb-2a88a6e60ecd
+# ╠═5341bba7-d2fd-4f3c-a8ef-6237320e9fc9
+# ╠═750053ce-5c78-11f1-9dbe-9b670302fb24
+# ╠═f60a36d4-438a-407b-850e-dedea28a4dad
+# ╠═d662d5e4-fd98-4e53-adad-4cd891845072
+# ╠═75005716-5c78-11f1-bc43-4d094e1e6582
+# ╠═7ceb63c4-bfd3-40db-9737-fe38603af6e3
+# ╠═3b443af6-e911-4324-86e3-6e58ec0733e7
+# ╠═75005b8a-5c78-11f1-9cd9-4f990e691ee0
+# ╠═75005cf2-5c78-11f1-80ad-d946ab7efb63
+# ╠═75005f86-5c78-11f1-9cfd-4d9ba9911a13
+# ╠═75006120-5c78-11f1-b0bd-5576b2d9b6cc
+# ╟─75006406-5c78-11f1-9327-a5aed19a90c7
+# ╠═8f6ee0dd-d70d-425a-a723-a510699f4819
+# ╟─115fb9e7-6962-465c-a3bf-d7def61a5ff0
+# ╟─750066ac-5c78-11f1-b3a2-9db1660107d3
+# ╠═7500671a-5c78-11f1-b78f-39c8612d1ae7
+# ╠═75006760-5c78-11f1-b4ee-3597d3ca9ccb
+# ╠═75006792-5c78-11f1-bd09-693a38217067
+# ╠═750067ba-5c78-11f1-8556-7d393c995389
+# ╠═750067e2-5c78-11f1-9946-2f839c5003e8
+# ╠═75006814-5c78-11f1-9c91-9bf4f5d05c9d
+# ╠═75006846-5c78-11f1-8a7f-93c504214586
+# ╠═7500686c-5c78-11f1-818f-5f462740e446
+# ╠═75006896-5c78-11f1-b081-99c9263e0b83
+# ╟─750068c8-5c78-11f1-8cfd-895d7ce3af27
+# ╠═5e0429e6-9f6f-484e-a663-1db116c41ff3
+# ╠═75006a06-5c78-11f1-8afc-8161a1b314c8
+# ╟─75006d7a-5c78-11f1-b5ae-a59af69ed196
+# ╟─75007124-5c78-11f1-8494-ef72f2e80384
+# ╟─750074f8-5c78-11f1-8c06-1f5fcb1748d8
+# ╟─7500785e-5c78-11f1-970c-d7455477d7da
+# ╟─75007bb0-5c78-11f1-8ee5-f70353584904
+# ╟─7500a68a-5c78-11f1-88a0-f39ecb105ef8
+# ╟─7500a6e4-5c78-11f1-b0e9-47ef8ea57632
+# ╟─00000000-0000-0000-0000-000000000001
+# ╟─00000000-0000-0000-0000-000000000002
