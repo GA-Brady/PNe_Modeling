@@ -1,0 +1,5 @@
+[CondaPkg]
+backend = "Current"
+
+[PythonCall]
+exe = "/Users/ga-brady/conda/envs/fac_env/bin/python"
