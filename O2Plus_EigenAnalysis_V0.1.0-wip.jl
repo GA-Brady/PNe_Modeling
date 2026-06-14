@@ -239,6 +239,7 @@ begin
 	#=
 	photoionized and radiative cross section functions are malformed. There is a broadcast error between xsection functions and bfoscstrength. Need to be reformatted because of the parameter vector. Broadcasting attempts to connect the ν vector and the parameter vector, which are not necessarily the same length
 	=#
+	
 	function photocrosssection(ν, p, gi, gf, li, lf, thermalenergy)
 		# gives the crosssection in cm^2 of the species for an incident photon energy
 		
