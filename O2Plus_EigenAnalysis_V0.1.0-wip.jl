@@ -21,6 +21,7 @@ begin
 	using DataFrames
 	using Statistics
 	using QuadGK
+	using Interpolations
 	
 	fac 	= pyimport("pfac.fac")
 	ftab  	= pyimport("pfac.table")
@@ -34,7 +35,10 @@ begin
 	const h 	= 4.135e-15 # eV ⋅ s
 	const c 	= 2.99e10  	# cm / s
 	const kb 	= 8.62e-5   # eV / Kelvin 
-	const α 	= 1 / 137 	# fine structure constant
+	const α 	= 1 / 137.036 	# fine structure constant
+	
+	const eV_to_Hartree = 1 / 27.211 # atomic units conversion factor
+	const Hartree_to_eV = 27.211     # eV conversion factor
 end
 
 # ╔═╡ f06bfd41-3f5e-483b-b421-756e7ce0fcff
@@ -76,37 +80,6 @@ begin
 	println("CSTRN: $(CSTRN)")
 	println("ΔE   : $(ΔE)")
 
-end
-
-# ╔═╡ 1be147dc-92c7-4078-a4b8-d75f3f58d781
-
-
-# ╔═╡ ab5b9592-5f39-4fc4-a890-29a82f311816
-begin
-	function collision_strength(p::Vector{Float64}, E_incident::Float64, E_threshold)
-		
-		x = E_incident ./ E_threshold
-		y = 1 .- 1 ./ x
-		Ω = p[1] .* log.(x) .+ p[2] .* y.^2 .+ p[3] ./ x .* y .+ p[4] ./ x.^2 .* y
-		
-		if Ω .<= 0
-			return 0
-		else
-			return Ω
-		end
-	end
-end
-
-# ╔═╡ 02fda065-185a-4d03-b47a-278c5b2babe8
-begin
-	E_min = minimum(EGRID)
-	E_max = maximum(EGRID)
-	
-	E_vec = collect(LinRange(E_min, E_max, 100))
-	S_vec = [collision_strength(PARAM, E, ΔE) for E in E_vec]
-	
-	scatter(EGRID .+ ΔE, CSTRN)
-	plot!(E_vec, S_vec)
 end
 
 # ╔═╡ c2420e2a-34c4-4d51-a72c-19257abf14ed
@@ -165,9 +138,17 @@ end
 # ╔═╡ d79c83b9-f3e0-497a-8ddc-1473f789ac99
 FACrrunpacker(O4P_rr_file)
 
+# ╔═╡ aa1c0378-513c-4f1e-89da-248ed3e11574
+rr_RRGRD[1]
+
+# ╔═╡ 006980c0-28ab-4f39-929d-1fa64862e0c7
+begin
+	rr_PIGRD[1]
+end
+
 # ╔═╡ a5f0e19b-1067-4156-a7bb-4018ac16b69f
 begin
-	function bfoscstrength(photonenergy::Float64, p::Vector{Float64}, l, thermalizingenergy)
+	function bfoscstrength(photonenergy::Float64, p::Vector{Float64}, lb, thermalizingenergy)
 		# l 	:= orbital angular momentum of ionized shell
 		# E_p  	:= incident photon energy
 		# E_th 	:= ionization threshold energy
@@ -175,7 +156,7 @@ begin
 		
 		x = abs((ΔE + p[4]) / p[4])
 		y = (1 + p[3]) / (sqrt(x) + p[3])
-		dgf = photonenergy / (ΔE+ p[4]) * p[1] * (x ^ (-3.5 - l + 0.5 * p[2])) * y ^ p[2]
+		dgf = photonenergy / (ΔE+ p[4]) * p[1] * (x ^ (-3.5 - lb + 0.5 * p[2])) * y ^ p[2]
 
 		# dgf is in units of hartree^-1 [1 / energy]
 		# function logic to calculate dgf has been verified
@@ -195,6 +176,12 @@ begin
 
 	rrE_vec = collect(LinRange(rrE_min, rrE_max, 100))
 	bf_strn_vec  = [bfoscstrength(E, rr_PARAM, 0, rr_ΔE) for E in rrE_vec]
+end
+
+# ╔═╡ f3ed0fa9-c9f8-4040-b1a4-a4dd7122f953
+begin
+	scatter(rr_EGRID, rr_gf)
+	plot!(rrE_vec .- rr_ΔE, bf_strn_vec)
 end
 
 # ╔═╡ 42ab7cc6-c06a-4d84-ba76-34c214526cbe
@@ -240,23 +227,33 @@ begin
 	photoionized and radiative cross section functions are malformed. There is a broadcast error between xsection functions and bfoscstrength. Need to be reformatted because of the parameter vector. Broadcasting attempts to connect the ν vector and the parameter vector, which are not necessarily the same length
 	=#
 	
-	function photocrosssection(ν, p, gi, gf, li, lf, thermalenergy)
+	function photocrosssection(ν, p, gb, gf, lb, lf, thermalenergy)
 		# gives the crosssection in cm^2 of the species for an incident photon energy
 		
 		photonenergy = h * ν
-		dgf = bfoscstrength(photonenergy, p, lf, thermalenergy)
+		dgf = bfoscstrength(photonenergy, p, lb, thermalenergy)
 
-		σ = (2 * π * α / gi) * dgf * a0 ^2
+		σ = (2 * π * α / gb) * dgf * a0 ^2
 		return σ
 	end
 
-	function radiativecrosssection(ν, p, gi, gf, li, lf, thermalenergy)
+	function radiativecrosssection(ν, p, gb, gf, lb, lf, thermalenergy)
 		# recombination cross section of radiative recombinations
-		ω = thermalenergy
-		ε =  h * ν - ω
+		# the formula provided in FAC requires units of Hartree
 		
-		coeff = α^2 / 2 * (gi / gf) * ω ^ 2 / (ε * (1 + 0.5 * α^2 * ε))
-		σ = photocrosssection(ν, p, gi, gf, li, lf, thermalenergy)
+		ω = h * ν * eV_to_Hartree
+		#println("ω: $ω")
+		
+		ε = ω - thermalenergy * eV_to_Hartree
+		#println("ε: $ε")
+		
+		coeff = α ^ 2 / 2 * (gb / gf) * ω ^ 2 / (ε * (1 + 0.5 * α ^ 2 * ε))
+		#println("c: $coeff")
+
+		σ = photocrosssection(ν, p, gb, gf, lb, lf, thermalenergy)
+		# photocrosssection already returns the values in cm^2
+		#println("σ: $σ")
+		
 		return coeff * σ
 	end
 
@@ -273,27 +270,53 @@ begin
 	end
 end
 
+# ╔═╡ 4369932c-7fb5-4493-9c60-824c04b91fc1
+begin
+	ν0 = (rr_ΔE + rr_EGRID[1]) / h
+	radiativecrosssection(ν0, rr_PARAM, 1, 2, 0, 0, rr_ΔE) / 1e-20 
+end
+
 # ╔═╡ fc950dab-3598-4194-b867-063420f3dee9
 begin
-	scatter(rr_EGRID, rr_RRGRD)
-	νvec = rr_ΔE ./ h
-	rvec = radiativecrosssection.(νvec, rr_PARAM, 1, 0, 3, 0, rr_ΔE)
+	νvec = rrE_vec ./ h
+	pivec  	= [photocrosssection(ν, rr_PARAM, 1, 1, 0, 0, rr_ΔE) for ν in νvec] ./ 1e-20
+	xsecvec = [radiativecrosssection(ν, rr_PARAM, 1, 1, 0, 0, rr_ΔE) for ν in νvec] ./ 1e-20
+	
 end
+
+# ╔═╡ 161a37a3-7a3b-44fb-9dc5-80488b5f375c
+begin
+	scatter(rr_EGRID, rr_RRGRD)
+	plot!(rrE_vec .- rr_ΔE, xsecvec)
+end
+
+# ╔═╡ 30ad6c1b-743e-4f8e-ab48-bb0b8f8dc531
+begin
+	scatter(rr_EGRID, rr_PIGRD)
+	plot!(rrE_vec .- rr_ΔE, pivec)
+end
+
+# ╔═╡ 9532a371-c3ab-4a0c-8d4f-7f06e01e33bb
+pivec[1]
 
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
 # ╠═0a1bb704-6391-11f1-9b23-a91665262d3d
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
 # ╠═f06bfd41-3f5e-483b-b421-756e7ce0fcff
-# ╠═1be147dc-92c7-4078-a4b8-d75f3f58d781
-# ╠═ab5b9592-5f39-4fc4-a890-29a82f311816
-# ╠═02fda065-185a-4d03-b47a-278c5b2babe8
 # ╠═ede3463c-65f7-4bcb-b873-6190340b11ce
 # ╠═c2420e2a-34c4-4d51-a72c-19257abf14ed
 # ╠═8905abb5-93df-4271-8ac2-081b2db56665
 # ╠═d79c83b9-f3e0-497a-8ddc-1473f789ac99
 # ╠═8100381f-fe1a-46fd-a039-cd4d77c29d55
 # ╠═a9ac6d4d-bd42-446b-a08f-cc9f5851b2a4
+# ╠═f3ed0fa9-c9f8-4040-b1a4-a4dd7122f953
+# ╠═161a37a3-7a3b-44fb-9dc5-80488b5f375c
+# ╠═aa1c0378-513c-4f1e-89da-248ed3e11574
+# ╠═4369932c-7fb5-4493-9c60-824c04b91fc1
 # ╠═fc950dab-3598-4194-b867-063420f3dee9
+# ╠═30ad6c1b-743e-4f8e-ab48-bb0b8f8dc531
+# ╠═006980c0-28ab-4f39-929d-1fa64862e0c7
+# ╠═9532a371-c3ab-4a0c-8d4f-7f06e01e33bb
 # ╠═a5f0e19b-1067-4156-a7bb-4018ac16b69f
 # ╠═42ab7cc6-c06a-4d84-ba76-34c214526cbe
