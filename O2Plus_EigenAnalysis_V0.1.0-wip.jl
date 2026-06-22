@@ -9,28 +9,29 @@ begin
     import Pkg
     # Disables Pluto's isolated environment and uses your terminal project instead
     Pkg.activate(".") 
-    
-    using PythonCall
-    np = pyimport("numpy")
-end
 
-# ╔═╡ 0a1bb704-6391-11f1-9b23-a91665262d3d
-begin
-	using Plots
+    using Plots
 	using LinearAlgebra
 	using DataFrames
 	using Statistics
 	using QuadGK
 	using Interpolations
-	
+
+	# python dependencies
+    using PythonCall
+    np = pyimport("numpy")
 	fac 	= pyimport("pfac.fac")
 	ftab  	= pyimport("pfac.table")
 	rfac    = pyimport("pfac.rfac")
 	sys 	= pyimport("sys")
-end
+
+	fac_dir  	= joinpath(pwd(), "AMDS_data")
+end;
 
 # ╔═╡ 06a00479-13de-4fc2-83c7-ba263895ad86
 begin
+	# block defining physical constants
+	
 	const a0 	= 5.291e-9  # bohr radius in cm
 	const h 	= 4.135e-15 # eV ⋅ s
 	const c 	= 2.99e10  	# cm / s
@@ -39,64 +40,7 @@ begin
 	
 	const eV_to_Hartree = 1 / 27.211 # atomic units conversion factor
 	const Hartree_to_eV = 27.211     # eV conversion factor
-end
-
-# ╔═╡ f06bfd41-3f5e-483b-b421-756e7ce0fcff
-begin
-	# collisional excitation stuff
-	fac_dir  	= joinpath(pwd(), "AMDS_data")
-	O4Pci_file 	= joinpath(fac_dir, "O04a.ci")
-	
-	data = rfac.read_ci(O4Pci_file)
-
-	# rfac.read_ci returns back a two element list
-	# !! these are python objects so they are 0-indexed!!
-	# element 0 - header (which appears to be a dict)
-	# element 1 - tuple of blocks (each element of the tuple appears to be a dict)
-	println(data[0])
-	
-	bound_2j 	= 0
-	free_index 	= 0
-	
-	println("gridstuff")
-	#println(data[1][bound_2j])
-
-	pyEGRID 	= data[1][bound_2j]["EGRID"]
-
-	# We are taking data from the jth block
-	pyPARAM 	= data[1][bound_2j]["parameters"][free_index]
-	pyCSTRN 	= data[1][bound_2j]["collision strength"][free_index]
-	pyΔE     	= data[1][bound_2j]["Delta E"][free_index]
-
-	
-	# converting python objects to julia objects
-	PARAM 	= pyconvert(Vector{Float64}, pyPARAM)
-	EGRID 	= pyconvert(Vector{Float64}, pyEGRID)
-	CSTRN 	= pyconvert(Vector{Float64}, pyCSTRN)
-	ΔE 		= pyconvert(Float64, pyΔE)
-	
-	println("PARAM: $(PARAM)")
-	println("EGRID: $(EGRID)")
-	println("CSTRN: $(CSTRN)")
-	println("ΔE   : $(ΔE)")
-
-end
-
-# ╔═╡ c2420e2a-34c4-4d51-a72c-19257abf14ed
-struct RR
-	boundindex::Vector{Float64}
-	bound2j::Vector{Float64}
-	freeindex::Vector{Float64}
-	free2j::Vector{Float64}
-	deltaE::Vector{Float64}
-	deltal::Vector{Float64}
-	param::Array{Float64}
-end
-
-# ╔═╡ ede3463c-65f7-4bcb-b873-6190340b11ce
-struct Species
-	rr::RR
-end
+end;
 
 # ╔═╡ 8905abb5-93df-4271-8ac2-081b2db56665
 begin
@@ -117,7 +61,7 @@ end
 begin
 	O4P_rr_file = joinpath(fac_dir, "O04a.rr")
 	rr_header, rr_data = rfac.read_rr(O4P_rr_file)
-	print(rr_data[0])
+	print(rr_data)
 
 	pyrr_PARAM 	= rr_data[0]["parameters"][0]
 	pyrr_EGRID 	= rr_data[0]["EGRID"]
@@ -138,51 +82,90 @@ end
 # ╔═╡ d79c83b9-f3e0-497a-8ddc-1473f789ac99
 FACrrunpacker(O4P_rr_file)
 
-# ╔═╡ aa1c0378-513c-4f1e-89da-248ed3e11574
-rr_RRGRD[1]
-
-# ╔═╡ 006980c0-28ab-4f39-929d-1fa64862e0c7
+# ╔═╡ fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 begin
-	rr_PIGRD[1]
-end
-
-# ╔═╡ a5f0e19b-1067-4156-a7bb-4018ac16b69f
-begin
-	function bfoscstrength(photonenergy::Float64, p::Vector{Float64}, lb, thermalizingenergy)
-		# l 	:= orbital angular momentum of ionized shell
-		# E_p  	:= incident photon energy
-		# E_th 	:= ionization threshold energy
-		ΔE = photonenergy - thermalizingenergy
-		
-		x = abs((ΔE + p[4]) / p[4])
-		y = (1 + p[3]) / (sqrt(x) + p[3])
-		dgf = photonenergy / (ΔE+ p[4]) * p[1] * (x ^ (-3.5 - lb + 0.5 * p[2])) * y ^ p[2]
-
-		# dgf is in units of hartree^-1 [1 / energy]
-		# function logic to calculate dgf has been verified
-		
-		if dgf <= 1e-10
-			return 0
-		else
-			return dgf
-		end
+	struct Prr
+		p1::Float64
+		p2::Float64
+		p3::Float64
+		p4::Float64
 	end
 end
 
-# ╔═╡ a9ac6d4d-bd42-446b-a08f-cc9f5851b2a4
+# ╔═╡ 1256163d-1be6-4742-a080-baf5136caf83
 begin
-	rrE_min = rr_ΔE
-	rrE_max = rr_ΔE + 1000
-
-	rrE_vec = collect(LinRange(rrE_min, rrE_max, 100))
-	bf_strn_vec  = [bfoscstrength(E, rr_PARAM, 0, rr_ΔE) for E in rrE_vec]
+	function rrparamblockunpacker(pmatrix)
+		m, n = size(pmatrix)
+		pvec = fill(Prr(-1,-1,-1,-1), m)
+		
+		for row in 1:m
+			p1, p2, p3, p4 = pmatrix[row, :]			
+			params = Prr(p1, p2, p3, p4)
+			pvec[row] = params
+		end
+		
+		return pvec
+	end
 end
 
-# ╔═╡ f3ed0fa9-c9f8-4040-b1a4-a4dd7122f953
+# ╔═╡ 1c6a1132-bd43-4d5b-a03c-08cf21fb24db
 begin
-	scatter(rr_EGRID, rr_gf)
-	plot!(rrE_vec .- rr_ΔE, bf_strn_vec)
+	function rrblockreader(block)
+		energy 	= pyconvert(Vector{Float64}, block["Delta E"])
+		params 	= pyconvert(Array{Float64}, block["parameters"])
+		
+		# bound index and angular momentum
+		bindex 	= pyconvert(Vector{Float64}, block["bound_index"])
+		b2j 	= pyconvert(Vector{Float64}, block["bound_2J"])
+
+		# free index and angular momentum
+		findex 	= pyconvert(Vector{Float64}, block["free_index"])
+		f2j 	= pyconvert(Vector{Float64}, block["free_2J"])
+		
+		deltal 	= pyconvert(Vector{Float64}, block["Delta L"])
+		return energy, params, bindex, b2j, findex, f2j, deltal
+	end
 end
+
+# ╔═╡ f1a53e3c-fd60-4c8c-8931-66a92e28dc36
+begin
+	nelectrons = 4
+	OyxgenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
+	RRheader, RRdata = rfac.read_rr(O4P_rr_file)
+
+	nblocks = pyconvert(Int64, RRheader["NBlocks"])
+
+	for i in 0:(nblocks-1)
+		# Iterating across all the blocks
+		# RRdata is still a python object at this point ∴ 0-indexed
+		
+	end
+	
+	# extracting vectors from the blocks
+	energy, params, bindex, b2j, findex, f2j, deltal = rrblockreader(RRdata[1])
+	prrvec = rrparamblockunpacker(params)
+
+	# masks to avoid unnecessary computation
+	bmask = bindex .!= 0  # only to excited states
+	fmask = findex .== 46 # only from ground state of O03
+	
+	# total mask of case B recombination
+	tmask = bmask .&& fmask
+
+	# filtering our values to the ones we really care about
+	filtered_energy = energy[tmask]
+	filtered_prrvec = prrvec[tmask]
+	filtered_bindex = bindex[tmask]
+	filtered_b2j    = b2j[tmask]
+	filtered_findex = findex[tmask]
+	filtered_f2j    = f2j[tmask]
+	filtered_deltal = deltal[tmask]
+
+	num = length(filtered_energy)
+end
+
+# ╔═╡ 451690bc-74ba-461b-bb1d-f63011d8db08
+rrparamblockunpacker(params)
 
 # ╔═╡ 42ab7cc6-c06a-4d84-ba76-34c214526cbe
 begin
@@ -195,7 +178,7 @@ begin
 
 	function maxwellianED(E, T)
 		# maxwell thermal distribution of velocities
-		if E < 0
+		if E <= 0
 			return 0
 		else
 			coeff = 2 * π * (1 / (π * kb * T))^(3/2)
@@ -222,15 +205,45 @@ begin
 		# to be implemented later...
 		return 0
 	end
+end
 
-	#=
-	photoionized and radiative cross section functions are malformed. There is a broadcast error between xsection functions and bfoscstrength. Need to be reformatted because of the parameter vector. Broadcasting attempts to connect the ν vector and the parameter vector, which are not necessarily the same length
-	=#
+# ╔═╡ 4f81ba64-7410-4a38-90d6-ded67520322d
+begin
+	"""
+	Photoionization and radiative crosssection functions
+	"""
+	function bfoscstrength(photonenergy::Float64, p::Vector{Float64}, lb, thermalizingenergy)
+		# l 	:= orbital angular momentum of ionized shell
+		
+		ΔE = photonenergy - thermalizingenergy
+
+		if ΔE <= 0
+			return 0
+		end
+		
+		x = abs((ΔE + p[4]) / p[4])
+		y = (1 + p[3]) / (sqrt(x) + p[3])
+		dgf = photonenergy / (ΔE+ p[4]) * p[1] * (x ^ (-3.5 - lb + 0.5 * p[2])) * y ^ p[2]
+
+		# dgf is in units of hartree^-1 [1 / energy]
+		# function logic to calculate dgf has been verified
+		
+		if dgf <= 1e-10
+			return 0
+		else
+			return dgf
+		end
+	end
 	
 	function photocrosssection(ν, p, gb, gf, lb, lf, thermalenergy)
 		# gives the crosssection in cm^2 of the species for an incident photon energy
 		
 		photonenergy = h * ν
+
+		if photonenergy <= thermalenergy
+			return 0
+		end
+		
 		dgf = bfoscstrength(photonenergy, p, lb, thermalenergy)
 
 		σ = (2 * π * α / gb) * dgf * a0 ^2
@@ -240,14 +253,27 @@ begin
 	function radiativecrosssection(ν, p, gb, gf, lb, lf, thermalenergy)
 		# recombination cross section of radiative recombinations
 		# the formula provided in FAC requires units of Hartree
+		δ = 1e-7 # factor for numerical stability because of the 1/ε term
 		
 		ω = h * ν * eV_to_Hartree
 		#println("ω: $ω")
 		
 		ε = ω - thermalenergy * eV_to_Hartree
 		#println("ε: $ε")
+
+		if ε <= 0
+			return 0
+		end
+    
+	    if ε < δ
+	        # At the exact threshold, use the analytically regularized limit 
+	        # where the 1/ε singularity cancels out.
+	        denom = δ
+		else
+			denom = (ε * (1 + 0.5 * α ^ 2 * ε))
+	    end
 		
-		coeff = α ^ 2 / 2 * (gb / gf) * ω ^ 2 / (ε * (1 + 0.5 * α ^ 2 * ε))
+		coeff = α ^ 2 / 2 * (gb / gf) * ω ^ 2 / denom
 		#println("c: $coeff")
 
 		σ = photocrosssection(ν, p, gb, gf, lb, lf, thermalenergy)
@@ -256,67 +282,18 @@ begin
 		
 		return coeff * σ
 	end
-
-	function volumephotoionizerate(ν0, species, T)
-		# volumetric photoionizing rate 
-		# needs to be more numerically stable... big error bars
-		σ(ν) = crosssection(ν, species)
-
-		# ionizing budget: flux * cross section * optical depth / photon energy
-		integrand(ν, T) = uνlaw(ν, T) * σ(ν) / ( h * ν) * exp( - opticaldepth(ν))
-		integral, error = quadgk(x -> integrand(x, T), ν0, Inf, rtol=1e-13)
-
-		return integral, error
-	end
 end
-
-# ╔═╡ 4369932c-7fb5-4493-9c60-824c04b91fc1
-begin
-	ν0 = (rr_ΔE + rr_EGRID[1]) / h
-	radiativecrosssection(ν0, rr_PARAM, 1, 2, 0, 0, rr_ΔE) / 1e-20 
-end
-
-# ╔═╡ fc950dab-3598-4194-b867-063420f3dee9
-begin
-	νvec = rrE_vec ./ h
-	pivec  	= [photocrosssection(ν, rr_PARAM, 1, 1, 0, 0, rr_ΔE) for ν in νvec] ./ 1e-20
-	xsecvec = [radiativecrosssection(ν, rr_PARAM, 1, 1, 0, 0, rr_ΔE) for ν in νvec] ./ 1e-20
-	
-end
-
-# ╔═╡ 161a37a3-7a3b-44fb-9dc5-80488b5f375c
-begin
-	scatter(rr_EGRID, rr_RRGRD)
-	plot!(rrE_vec .- rr_ΔE, xsecvec)
-end
-
-# ╔═╡ 30ad6c1b-743e-4f8e-ab48-bb0b8f8dc531
-begin
-	scatter(rr_EGRID, rr_PIGRD)
-	plot!(rrE_vec .- rr_ΔE, pivec)
-end
-
-# ╔═╡ 9532a371-c3ab-4a0c-8d4f-7f06e01e33bb
-pivec[1]
 
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
-# ╠═0a1bb704-6391-11f1-9b23-a91665262d3d
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
-# ╠═f06bfd41-3f5e-483b-b421-756e7ce0fcff
-# ╠═ede3463c-65f7-4bcb-b873-6190340b11ce
-# ╠═c2420e2a-34c4-4d51-a72c-19257abf14ed
 # ╠═8905abb5-93df-4271-8ac2-081b2db56665
 # ╠═d79c83b9-f3e0-497a-8ddc-1473f789ac99
 # ╠═8100381f-fe1a-46fd-a039-cd4d77c29d55
-# ╠═a9ac6d4d-bd42-446b-a08f-cc9f5851b2a4
-# ╠═f3ed0fa9-c9f8-4040-b1a4-a4dd7122f953
-# ╠═161a37a3-7a3b-44fb-9dc5-80488b5f375c
-# ╠═aa1c0378-513c-4f1e-89da-248ed3e11574
-# ╠═4369932c-7fb5-4493-9c60-824c04b91fc1
-# ╠═fc950dab-3598-4194-b867-063420f3dee9
-# ╠═30ad6c1b-743e-4f8e-ab48-bb0b8f8dc531
-# ╠═006980c0-28ab-4f39-929d-1fa64862e0c7
-# ╠═9532a371-c3ab-4a0c-8d4f-7f06e01e33bb
-# ╠═a5f0e19b-1067-4156-a7bb-4018ac16b69f
+# ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
+# ╠═fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
+# ╠═1256163d-1be6-4742-a080-baf5136caf83
+# ╠═451690bc-74ba-461b-bb1d-f63011d8db08
+# ╠═1c6a1132-bd43-4d5b-a03c-08cf21fb24db
 # ╠═42ab7cc6-c06a-4d84-ba76-34c214526cbe
+# ╠═4f81ba64-7410-4a38-90d6-ded67520322d
