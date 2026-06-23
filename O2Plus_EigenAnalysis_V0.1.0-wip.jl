@@ -16,6 +16,7 @@ begin
 	using Statistics
 	using QuadGK
 	using Interpolations
+	using CSV
 
 	# python dependencies
     using PythonCall
@@ -31,13 +32,13 @@ end;
 # ╔═╡ 06a00479-13de-4fc2-83c7-ba263895ad86
 begin
 	# block defining physical constants
-	
 	const a0 	= 5.291e-9  # bohr radius in cm
 	const h 	= 4.135e-15 # eV ⋅ s
 	const c 	= 2.99e10  	# cm / s
 	const kb 	= 8.62e-5   # eV / Kelvin 
 	const α 	= 1 / 137.036 	# fine structure constant
-	
+
+	# conversion factors
 	const eV_to_Hartree = 1 / 27.211 # atomic units conversion factor
 	const Hartree_to_eV = 27.211     # eV conversion factor
 end;
@@ -80,6 +81,16 @@ begin
 		end
 		
 		return pvec
+	end
+end
+
+# ╔═╡ 729ba9a7-bcc2-4386-9348-7cde5d21de27
+begin
+	function enblockreader(block)
+		ilev = pyconvert(Vector{Int64}, block["ILEV"])
+		vnl  = pyconvert(Vector{Int64}, block["VNL"])
+
+		return ilev, vnl
 	end
 end
 
@@ -225,74 +236,85 @@ end
 # ╔═╡ f1a53e3c-fd60-4c8c-8931-66a92e28dc36
 begin
 	nelectrons = 4
+
+	OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
+	ENheader, ENdata = rfac.read_en(OxygenENfile)
+
+	O04ilev = []
+	O04vnls  = []
+
+	for ENblock in ENdata
+		ilevs, vnls = enblockreader(ENblock)
+
+		append!(O04ilev, ilevs)
+		append!(O04vnls, vnls)
+	end
+	
 	OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
 	RRheader, RRdata = rfac.read_rr(OxygenRRfile)
 
 	nblocks = pyconvert(Int64, RRheader["NBlocks"])
-
-	for i in 0:(nblocks-1)
-		# Iterating across all the blocks
-		# RRdata is still a python object at this point ∴ 0-indexed
-		
-	end
-	
-	# extracting vectors from the blocks
-	energy, params, bindex, b2j, findex, f2j, deltal = rrblockreader(RRdata[1])
-	prrvec = rrparamblockunpacker(params)
-
-	# masks to avoid unnecessary computation
-	bmask = bindex .!= 0  # only to excited states
-	fmask = findex .== 46 # only from ground state of O03
-	
-	# total mask of case B recombination
-	tmask = bmask .&& fmask
-
-	# filtering our values to the ones we really care about
-	filtered_energy = energy[tmask]
-	filtered_prrvec = prrvec[tmask]
-	filtered_bindex = bindex[tmask]
-	filtered_b2j    = b2j[tmask]
-	filtered_findex = findex[tmask]
-	filtered_f2j    = f2j[tmask]
-	filtered_deltal = deltal[tmask]
-
-	num = length(filtered_energy)
-	testenergies = collect(50:.1:125)
+	testenergies = collect(0:.1:150)
 	crosssections = zeros(length(testenergies))
 
-	for j in 1:1:num
-	# will need to use lookup table to get free lb, lf does not matter.
-	# radiativecrosssection(E, p::Prr, gb, gf, lb, lf, thermalenergy)
-		for (i, energy) in enumerate(testenergies)
-			σ = radiativecrosssection(energy, 
-						   filtered_prrvec[j],
-						   filtered_b2j[j] + 1,
-						   filtered_f2j[j] + 1,
-						   1,
-						   0,
-						   filtered_energy[j]
-						  )
-			crosssections[i] += σ
+	for i in 0:(nblocks-1)
+		# extracting vectors from the blocks
+		energy, params, bindex, b2j, findex, f2j, deltal = rrblockreader(RRdata[i])
+		prrvec = rrparamblockunpacker(params)
+	
+		# masks to avoid unnecessary computation
+		bmask = bindex .!= 0  # only to excited states
+		fmask = findex .== 46 # only from ground state of O03
+		
+		# total mask of case B recombination
+		tmask = bmask .&& fmask
+	
+		# filtering our values to the ones we really care about
+		filtered_energy = energy[tmask]
+		filtered_prrvec = prrvec[tmask]
+		filtered_bindex = bindex[tmask]
+		filtered_b2j    = b2j[tmask]
+		filtered_findex = findex[tmask]
+		filtered_f2j    = f2j[tmask]
+		filtered_deltal = deltal[tmask]
+	
+		num = length(filtered_energy)
+		println("num: $num")
+	
+		for j in 1:1:num
+		# will need to use lookup table to get free lb, lf does not matter.
+		# radiativecrosssection(E, p::Prr, gb, gf, lb, lf, thermalenergy)
+			for (k, energy) in enumerate(testenergies)
+				vnlindex = findfirst(isequal(filtered_bindex[j]), O04ilev)
+				lb = O04vnls[vnlindex] % 100
+				
+				σ = radiativecrosssection(energy, 
+							   filtered_prrvec[j],
+							   filtered_b2j[j] + 1,
+							   filtered_f2j[j] + 1,
+							   lb,
+							   0,
+							   filtered_energy[j]
+							  )
+				crosssections[k] += σ
+			end
 		end
-		println(j)
+		println("block: $i")
 	end
 end
 
 # ╔═╡ 51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
 plot(testenergies, crosssections ./ 1e-20)
 
-# ╔═╡ 451690bc-74ba-461b-bb1d-f63011d8db08
-rrparamblockunpacker(params)
-
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
-# ╠═8905abb5-93df-4271-8ac2-081b2db56665
+# ╟─8905abb5-93df-4271-8ac2-081b2db56665
 # ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
 # ╠═51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
 # ╠═fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 # ╠═1256163d-1be6-4742-a080-baf5136caf83
-# ╠═451690bc-74ba-461b-bb1d-f63011d8db08
+# ╠═729ba9a7-bcc2-4386-9348-7cde5d21de27
 # ╠═1c6a1132-bd43-4d5b-a03c-08cf21fb24db
 # ╠═42ab7cc6-c06a-4d84-ba76-34c214526cbe
 # ╠═4f81ba64-7410-4a38-90d6-ded67520322d
