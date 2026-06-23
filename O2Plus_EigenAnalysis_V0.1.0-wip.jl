@@ -17,6 +17,7 @@ begin
 	using QuadGK
 	using Interpolations
 	using CSV
+	using PlutoUI
 
 	# python dependencies
     using PythonCall
@@ -43,6 +44,16 @@ begin
 	const Hartree_to_eV = 27.211     # eV conversion factor
 end;
 
+# ╔═╡ 5df90933-6f23-4137-9c04-95008732fb77
+begin
+    for i in 1:10
+        # Your long execution code here
+        
+        @info("Current Block $i / 10")
+        sleep(0.5)
+    end
+end
+
 # ╔═╡ 8905abb5-93df-4271-8ac2-081b2db56665
 begin
 	function FACrrunpacker(filepath)
@@ -57,6 +68,11 @@ begin
 		print(header)
 	end
 end
+
+# ╔═╡ 51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
+#=╠═╡
+plot(testenergies, crosssections ./ 1e-20)
+  ╠═╡ =#
 
 # ╔═╡ fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 begin
@@ -249,7 +265,16 @@ begin
 		append!(O04ilev, ilevs)
 		append!(O04vnls, vnls)
 	end
-	
+
+	# the q+1 ground state is ALWAYS the first entry in the second EN block
+	# for all ionization states of oxygen (manually verified)
+
+	# finding the q+1 ground state free-index
+	# since ENdata is a python object ∴ zero-indexed
+	qplusblock = ENdata[1]
+	qplusilev, _ = enblockreader(qplusblock)
+	qplusground = qplusilev[1]
+
 	OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
 	RRheader, RRdata = rfac.read_rr(OxygenRRfile)
 
@@ -264,7 +289,7 @@ begin
 	
 		# masks to avoid unnecessary computation
 		bmask = bindex .!= 0  # only to excited states
-		fmask = findex .== 46 # only from ground state of O03
+		fmask = findex .== qplusground # only from ground state of O03
 		
 		# total mask of case B recombination
 		tmask = bmask .&& fmask
@@ -279,7 +304,6 @@ begin
 		filtered_deltal = deltal[tmask]
 	
 		num = length(filtered_energy)
-		println("num: $num")
 	
 		for j in 1:1:num
 		# will need to use lookup table to get free lb, lf does not matter.
@@ -299,16 +323,17 @@ begin
 				crosssections[k] += σ
 			end
 		end
-		println("block: $i")
+		@info("Block $i / $nblocks")
 	end
-end
 
-# ╔═╡ 51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
-plot(testenergies, crosssections ./ 1e-20)
+	df = DataFrame(ENERGY = testenergies, XSECTN = crosssections)
+	CSV.write("my_output.csv", df)
+end
 
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
+# ╠═5df90933-6f23-4137-9c04-95008732fb77
 # ╟─8905abb5-93df-4271-8ac2-081b2db56665
 # ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
 # ╠═51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
