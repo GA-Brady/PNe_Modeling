@@ -32,6 +32,9 @@ end;
 
 # ╔═╡ 06a00479-13de-4fc2-83c7-ba263895ad86
 begin
+	#debugging statement
+	const verbose = true
+	
 	# block defining physical constants
 	const a0 	= 5.291e-9  # bohr radius in cm
 	const h 	= 4.135e-15 # eV ⋅ s
@@ -43,6 +46,14 @@ begin
 	const eV_to_Hartree = 1 / 27.211 # atomic units conversion factor
 	const Hartree_to_eV = 27.211     # eV conversion factor
 end;
+
+# ╔═╡ 5325a883-7bd5-4f6b-b2d2-d72b9693478c
+
+
+# ╔═╡ b30d80a6-fb36-4baf-bb75-a17e319566c3
+md"""
+### ----- functions ----- ###
+"""
 
 # ╔═╡ fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 begin
@@ -252,6 +263,8 @@ begin
 		nblocks = pyconvert(Int64, RRheader["NBlocks"])
 	
 		for i in 0:(nblocks-1)
+			verbose && @info("Block $i / $nblocks")
+			
 			# extracting vectors from the blocks
 			energy, params, bindex, b2j, findex, f2j, deltal = rrblockreader(RRdata[i])
 			prrvec = rrparamblockunpacker(params)
@@ -276,7 +289,8 @@ begin
 	
 			# iterating through the elements in the block
 			for j in 1:1:num
-	
+				# debugging statement that prints live to output so runtime can be monitored
+				
 				# iterating across test energies
 				for (k, energy) in enumerate(energies)
 					vnlindex = findfirst(isequal(filtered_bindex[j]), qilev)
@@ -296,8 +310,6 @@ begin
 					crosssections[k] += σ
 				end
 			end
-			# debugging statement that prints live to output so runtime can be monitored
-			@info("Block $i / $nblocks")
 		end
 
 		return crosssections
@@ -306,31 +318,43 @@ end
 
 # ╔═╡ f1a53e3c-fd60-4c8c-8931-66a92e28dc36
 begin
-	nelectrons = 7
-	energies = collect(0.0:1:150)
-	
-	OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
-	OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
+	# checks to see if the case B cross sections need to be calculated
+	# this takes two hours to compute so be ready
+	if !isfile("oxygen_caseB_crosssections.csv")
+		atomicnumber = 8
+		
+		minenergy = 0.0
+		maxenergy = 100.0
+		slice = .01 # samples 10K points
+		
+		energies = collect(minenergy:slice:maxenergy)
+		df = DataFrame(ENERGY = energies)
 
-	
-	crosssections = caseBxsection(energies, OxygenENfile, OxygenRRfile)
-	
-	df = DataFrame(ENERGY = energies, XSECTN = crosssections)
-	CSV.write("my_output.csv", df)
+		for nelectrons in 1:atomicnumber
+			verbose && @info("NELE: $nelectrons / $atomicnumber")
+			OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
+			OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
+			df[!, Symbol("NELE_$nelectrons")] = caseBxsection(energies, OxygenENfile, OxygenRRfile)
+		end
+		
+		CSV.write("oxygen_caseB_crosssections.csv", df)
+	else
+		df = CSV.read("oxygen_caseB_crosssections.csv", DataFrame)
+	end
+
+	display(df)
 end
-
-# ╔═╡ 51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
-plot(energies, crosssections ./ 1e-20)
 
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
-# ╠═dfc60ff1-db70-4d09-8215-80340b262eb5
 # ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
-# ╠═51e01d0a-a289-4ba0-87b0-f0ba3d5e6973
+# ╠═5325a883-7bd5-4f6b-b2d2-d72b9693478c
+# ╟─b30d80a6-fb36-4baf-bb75-a17e319566c3
 # ╠═fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 # ╠═1256163d-1be6-4742-a080-baf5136caf83
 # ╠═729ba9a7-bcc2-4386-9348-7cde5d21de27
 # ╠═1c6a1132-bd43-4d5b-a03c-08cf21fb24db
 # ╠═42ab7cc6-c06a-4d84-ba76-34c214526cbe
 # ╠═4f81ba64-7410-4a38-90d6-ded67520322d
+# ╠═dfc60ff1-db70-4d09-8215-80340b262eb5
