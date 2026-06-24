@@ -47,9 +47,6 @@ begin
 	const Hartree_to_eV = 27.211     # eV conversion factor
 end;
 
-# ╔═╡ 5325a883-7bd5-4f6b-b2d2-d72b9693478c
-
-
 # ╔═╡ b30d80a6-fb36-4baf-bb75-a17e319566c3
 md"""
 ### ----- functions ----- ###
@@ -232,7 +229,8 @@ end
 
 # ╔═╡ dfc60ff1-db70-4d09-8215-80340b262eb5
 begin
-	function caseBxsection(energies, ENfile, RRfile)
+	function caseBxsection(energies, gsm, esm, ENfile, RRfile)
+		### ~~~~ should be moved outside function call ~~~~
 		# opening the files
 		ENheader, ENdata = rfac.read_en(ENfile)
 		RRheader, RRdata = rfac.read_rr(RRfile)
@@ -250,18 +248,10 @@ begin
 			append!(qvnls, vnls)
 		end
 	
-		# the q+1 ground state is ALWAYS the first entry in the second EN block
-		# for all ionization states of oxygen (manually verified)
-	
-		# finding the q+1 ground state free-index
-		# since ENdata is a python object ∴ zero-indexed
-		qplusblock = ENdata[1]
-		qplusilev, _ = enblockreader(qplusblock)
-		qplusground = qplusilev[1]
-	
 		# number of blocks in the file
+		### ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 		nblocks = pyconvert(Int64, RRheader["NBlocks"])
-	
+		
 		for i in 0:(nblocks-1)
 			verbose && @info("Block $i / $nblocks")
 			
@@ -270,8 +260,8 @@ begin
 			prrvec = rrparamblockunpacker(params)
 		
 			# masks to avoid unnecessary computation
-			bmask = bindex .!= 0  # only to excited states
-			fmask = findex .== qplusground # only from ground state of O03
+			bmask = bindex .∉ Ref(gsm)  # only to excited states
+			fmask = findex .∈ Ref(esm)  # only from ground state of O03
 			
 			# total mask of case B recombination
 			tmask = bmask .&& fmask
@@ -320,12 +310,41 @@ end
 begin
 	# checks to see if the case B cross sections need to be calculated
 	# this takes two hours to compute so be ready
-	if !isfile("oxygen_caseB_crosssections.csv")
-		atomicnumber = 8
+	atomicnumber = 8
 		
-		minenergy = 0.0
-		maxenergy = 100.0
-		slice = .01 # samples 10K points
+	minenergy 	= 0.0
+	maxenergy 	= 100.0
+	slice 		= 1 
+
+	#= default values for precomputed table
+	minenergy 	= 0.0   eV
+	maxenergy 	= 100.0 eV
+	slice 		= 0.01
+	=#
+
+	# these masks need to be dynamically coded instead of hardcoded eventually
+	# they were found by manually inspecting the .en files to find split ground states
+	groundstatemasks = [
+		[0],
+		[0],
+		[0],
+		[0],
+		[0, 1],
+		[0, 1, 2],
+		[0],
+		[0, 1, 2]]
+	# notice the excited state mask matches the pattern of the ground state mask
+	excitedstatemasks = [
+		[4],
+		[7],
+		[8],
+		[46],
+		[125],
+		[236, 237],
+		[272, 273, 274],
+		[266]]
+	
+	if !isfile("oxygen_caseB_crosssections.csv")
 		
 		energies = collect(minenergy:slice:maxenergy)
 		df = DataFrame(ENERGY = energies)
@@ -334,7 +353,10 @@ begin
 			verbose && @info("NELE: $nelectrons / $atomicnumber")
 			OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
 			OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
-			df[!, Symbol("NELE_$nelectrons")] = caseBxsection(energies, OxygenENfile, OxygenRRfile)
+
+			gsm = groundstatemasks[nelectrons]
+			esm = excitedstatemasks[nelectrons]
+			df[!, Symbol("NELE_$nelectrons")] = caseBxsection(energies, gsm, esm, OxygenENfile, OxygenRRfile)
 		end
 		
 		CSV.write("oxygen_caseB_crosssections.csv", df)
@@ -342,14 +364,45 @@ begin
 		df = CSV.read("oxygen_caseB_crosssections.csv", DataFrame)
 	end
 
-	display(df)
+	df
 end
+
+# ╔═╡ e76b3a9d-b32b-426a-813b-547c5ca0568b
+begin
+	nelectrons = 6
+	venergies = collect(minenergy:slice:maxenergy)
+	
+	verbose && @info("NELE: $nelectrons / $atomicnumber")
+	OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
+	OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
+
+	gsm = groundstatemasks[nelectrons]
+	esm = excitedstatemasks[nelectrons]
+	crosssections = caseBxsection(venergies, gsm, esm, OxygenENfile, OxygenRRfile)
+
+	# trying our hand at making an interpolation for the case B integrand
+	T = 1e4
+	
+	xs = minenergy:slice:maxenergy
+	ipt = linear_interpolation(xs, crosssections)
+end 
+
+# ╔═╡ a2d1538c-223a-4887-90d9-a29b42900e9a
+begin
+	integrand(x) = ipt(x) * maxwellianED(x, T)
+	integral, error = quadgk(x -> integrand(x), 0, 100)
+end
+
+# ╔═╡ e19ab3cd-a268-4fa7-826f-4ac25e523890
+plot(venergies, crosssections ./ 1e-20)
 
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
 # ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
-# ╠═5325a883-7bd5-4f6b-b2d2-d72b9693478c
+# ╠═e76b3a9d-b32b-426a-813b-547c5ca0568b
+# ╠═a2d1538c-223a-4887-90d9-a29b42900e9a
+# ╠═e19ab3cd-a268-4fa7-826f-4ac25e523890
 # ╟─b30d80a6-fb36-4baf-bb75-a17e319566c3
 # ╠═fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 # ╠═1256163d-1be6-4742-a080-baf5136caf83
