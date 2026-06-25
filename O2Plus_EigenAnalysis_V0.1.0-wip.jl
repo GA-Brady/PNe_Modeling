@@ -84,7 +84,7 @@ begin
 		[125],
 		[236, 237],
 		[272, 273, 274],
-		[266]]
+		[226]]
 end
 
 # ╔═╡ b30d80a6-fb36-4baf-bb75-a17e319566c3
@@ -239,6 +239,9 @@ end
 
 # ╔═╡ 8ca245db-94b1-4f0c-b51d-9267114e9789
 function caseB(T, gsm, esm, ENcontent, RRcontent)
+	#=
+	calculates the case B recombination coefficient by interpolating between the pre-computed FAC points
+	=#
 	ENheader, ENdata = ENcontent
 	RRheader, RRdata = RRcontent
 
@@ -256,6 +259,7 @@ function caseB(T, gsm, esm, ENcontent, RRcontent)
 	
 	nblocks = pyconvert(Int64, RRheader["NBlocks"])
 	vnldict = Dict{Int64, Int64}(zip(qilev, qvnls))
+	verbose && @info("nblocks: $nblocks")
 	verbose && @info("vnl dict length: $(length(vnldict))")
 
 	totalrate = 0.0
@@ -272,18 +276,20 @@ function caseB(T, gsm, esm, ENcontent, RRcontent)
 
 		fenergy = energy[mask]
 		fRRxsecMATRIX = RRxsecMATRIX[mask, :]
+		if length(fenergy) == 0
+			verbose && @info("Block $i was completely emptied by the mask filters.")
+		end
 
 		for j in 1:length(fenergy)
 			xsect = fRRxsecMATRIX[j, :]
-			intrp = linear_interpolation(egrid, xsect, extrapolation_bc=Line())
+			intrp = linear_interpolation(egrid, xsect, extrapolation_bc=0.0)
 			ethrm = fenergy[j]
-			emax = maxenergy - ethrm
+			emax = ethrm + last(egrid)
 			
 			ratej, _ = quadgk(0.0, emax) do x
-				eabsl = ethrm + x
 				σ = intrp(x) .* 1e-20
-				fE = maxwellianED(eabsl, T)
-				v  = sqrt(eabsl)
+				fE = maxwellianED(x, T)
+				v  = sqrt(x)
 	        return σ * fE * v * velscaling
     		end
 
@@ -294,8 +300,28 @@ function caseB(T, gsm, esm, ENcontent, RRcontent)
 	return totalrate
 end
 
-# ╔═╡ 52c18186-8b20-4291-89a9-9e3c363d8be6
-caseB(1e4, groundstatemasks[test_nelectrons], excitedstatemasks[test_nelectrons], test_ENcontents, test_RRcontents)
+# ╔═╡ 3fb0fba6-18c1-4fbe-b06f-c0507e3d297c
+begin
+	T = 1e4
+
+	caseBvec = zeros(Float64, atomicnumber)
+	
+	for i in 1:atomicnumber
+		ENfile = joinpath(fac_dir, "O0$(i)a.en")
+		RRfile = joinpath(fac_dir, "O0$(i)a.rr")
+		
+		ENcontents = rfac.read_en(ENfile)
+		RRcontents = rfac.read_rr(RRfile)
+
+		gsm = groundstatemasks[i]
+		esm = excitedstatemasks[i]
+
+		caseBvec[i] = caseB(T, gsm, esm, ENcontents, RRcontents)
+	end;
+end
+
+# ╔═╡ ae77b1c3-21f5-4a55-b3f0-7c7e509f9942
+caseBvec
 
 # ╔═╡ 4f81ba64-7410-4a38-90d6-ded67520322d
 begin
@@ -383,7 +409,8 @@ end
 # ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
 # ╠═2822d0de-da6f-4e1a-8df8-29eadb455fcc
 # ╠═9194879b-4d99-4416-bbf4-f1ac4820d40e
-# ╠═52c18186-8b20-4291-89a9-9e3c363d8be6
+# ╠═3fb0fba6-18c1-4fbe-b06f-c0507e3d297c
+# ╠═ae77b1c3-21f5-4a55-b3f0-7c7e509f9942
 # ╠═8ca245db-94b1-4f0c-b51d-9267114e9789
 # ╟─b30d80a6-fb36-4baf-bb75-a17e319566c3
 # ╠═fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
