@@ -41,11 +41,51 @@ begin
 	const c 	= 2.99e10  	# cm / s
 	const kb 	= 8.62e-5   # eV / Kelvin 
 	const α 	= 1 / 137.036 	# fine structure constant
+	const emass = 511e3     # eV/c^2
 
 	# conversion factors
 	const eV_to_Hartree = 1 / 27.211 # atomic units conversion factor
 	const Hartree_to_eV = 27.211     # eV conversion factor
+	const velscaling 	= 5.931e7    # 
 end;
+
+# ╔═╡ f1a53e3c-fd60-4c8c-8931-66a92e28dc36
+begin
+	# checks to see if the case B cross sections need to be calculated
+	atomicnumber = 8
+		
+	global minenergy 	= 0.0
+	global maxenergy 	= 1000.0
+	global slice 		= 1
+
+	#= default values for precomputed table
+	minenergy 	= 0.0   eV
+	maxenergy 	= 100.0 eV
+	slice 		= 0.01
+	=#
+
+	# these masks need to be dynamically coded instead of hardcoded eventually
+	# they were found by manually inspecting the .en files to find split ground states
+	groundstatemasks = [
+		[0],
+		[0],
+		[0],
+		[0],
+		[0, 1],
+		[0, 1, 2],
+		[0],
+		[0, 1, 2]]
+	# notice the excited state mask matches the pattern of the ground state mask
+	excitedstatemasks = [
+		[4],
+		[7],
+		[8],
+		[46],
+		[125],
+		[236, 237],
+		[272, 273, 274],
+		[266]]
+end
 
 # ╔═╡ b30d80a6-fb36-4baf-bb75-a17e319566c3
 md"""
@@ -107,6 +147,56 @@ begin
 	end
 end
 
+# ╔═╡ 9194879b-4d99-4416-bbf4-f1ac4820d40e
+begin
+	test_block = 1
+	test_index = 1
+	test_nelectrons = 6
+	
+	test_ENfile = joinpath(fac_dir, "O0$(test_nelectrons)a.en")
+	test_RRfile = joinpath(fac_dir, "O0$(test_nelectrons)a.rr")
+
+	test_ENcontents = rfac.read_en(test_ENfile)
+	test_RRcontents = rfac.read_rr(test_RRfile)
+
+	test_ENheader, test_ENdata = test_ENcontents
+	test_RRheader, test_RRdata = test_RRcontents
+
+	test_RRblock = test_RRdata[test_block]
+
+	nblocks = pyconvert(Int64, test_RRheader["NBlocks"])
+	test_egrid = pyconvert(Vector{Float64}, test_RRblock["EGRID"])
+	test_RRxsec   = pyconvert(Array{Float64}, test_RRblock["RR crosssection"])
+
+	qilev = Int64[]
+	qvnls = Int64[]
+
+	for ENblock in test_ENdata
+		ilevs, vnls = enblockreader(ENblock)
+		append!(qilev, ilevs)
+		append!(qvnls, vnls)
+	end
+	
+	vnldict = Dict{Int64, Int64}(zip(qilev, qvnls))
+
+	energy, params, bindex, b2j, findex, f2j, deltal = rrblockreader(test_RRblock)
+	pblock = rrparamblockunpacker(params)
+	
+	te = energy[test_index]
+	tp = pblock[test_index]
+	tgb = b2j[test_index] + 1
+	tgf = f2j[test_index] + 1
+	tbi = bindex[test_index]
+
+	vnl = get(vnldict, tbi, 0)
+	tlb = vnl % 100
+
+	test_energies = collect(minenergy:slice:maxenergy)
+end
+
+# ╔═╡ 2822d0de-da6f-4e1a-8df8-29eadb455fcc
+print(test_RRblock)
+
 # ╔═╡ 42ab7cc6-c06a-4d84-ba76-34c214526cbe
 begin
 	function uνlaw(ν, T)
@@ -146,6 +236,66 @@ begin
 		return 0
 	end
 end
+
+# ╔═╡ 8ca245db-94b1-4f0c-b51d-9267114e9789
+function caseB(T, gsm, esm, ENcontent, RRcontent)
+	ENheader, ENdata = ENcontent
+	RRheader, RRdata = RRcontent
+
+	# energy level extraction
+	qilev = Int64[]
+	qvnls = Int64[]
+		
+	# extracting the EN blocks to usable storage
+	for ENblock in ENdata
+		ilevs, vnls = enblockreader(ENblock)
+	
+		append!(qilev, ilevs)
+		append!(qvnls, vnls)
+	end
+	
+	nblocks = pyconvert(Int64, RRheader["NBlocks"])
+	vnldict = Dict{Int64, Int64}(zip(qilev, qvnls))
+	verbose && @info("vnl dict length: $(length(vnldict))")
+
+	totalrate = 0.0
+
+	for i in 0:(nblocks-1)
+		verbose && @info("Block $i / $(nblocks-1)")
+
+		block = RRdata[i]
+		egrid = pyconvert(Vector{Float64}, block["EGRID"])
+		RRxsecMATRIX = pyconvert(Array{Float64}, block["RR crosssection"]) #[test_index, :] is the correct access format
+		
+		energy, _, bindex, b2j, findex, f2j, _ = rrblockreader(block)
+		mask = (bindex .∉ Ref(gsm)) .&& (findex .∈ Ref(esm))
+
+		fenergy = energy[mask]
+		fRRxsecMATRIX = RRxsecMATRIX[mask, :]
+
+		for j in 1:length(fenergy)
+			xsect = fRRxsecMATRIX[j, :]
+			intrp = linear_interpolation(egrid, xsect, extrapolation_bc=Line())
+			ethrm = fenergy[j]
+			emax = maxenergy - ethrm
+			
+			ratej, _ = quadgk(0.0, emax) do x
+				eabsl = ethrm + x
+				σ = intrp(x) .* 1e-20
+				fE = maxwellianED(eabsl, T)
+				v  = sqrt(eabsl)
+	        return σ * fE * v * velscaling
+    		end
+
+			
+			totalrate += ratej
+		end
+	end
+	return totalrate
+end
+
+# ╔═╡ 52c18186-8b20-4291-89a9-9e3c363d8be6
+caseB(1e4, groundstatemasks[test_nelectrons], excitedstatemasks[test_nelectrons], test_ENcontents, test_RRcontents)
 
 # ╔═╡ 4f81ba64-7410-4a38-90d6-ded67520322d
 begin
@@ -219,7 +369,7 @@ begin
 		#println("σ: $σ")
 
 		xsection = coeff * σ
-		if xsection <= 1e-25
+		if xsection <= 1e-30
 			return 0
 		else 
 			return xsection
@@ -227,182 +377,14 @@ begin
 	end
 end
 
-# ╔═╡ dfc60ff1-db70-4d09-8215-80340b262eb5
-begin
-	function caseBxsection(energies, gsm, esm, ENfile, RRfile)
-		### ~~~~ should be moved outside function call ~~~~
-		# opening the files
-		ENheader, ENdata = rfac.read_en(ENfile)
-		RRheader, RRdata = rfac.read_rr(RRfile)
-
-		# initializing some vectors
-		crosssections = zeros(length(energies))
-		qilev = []
-		qvnls  = []
-		
-		# extracting the EN blocks to usable storage
-		for ENblock in ENdata
-			ilevs, vnls = enblockreader(ENblock)
-	
-			append!(qilev, ilevs)
-			append!(qvnls, vnls)
-		end
-	
-		# number of blocks in the file
-		### ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-		nblocks = pyconvert(Int64, RRheader["NBlocks"])
-		
-		for i in 0:(nblocks-1)
-			verbose && @info("Block $i / $nblocks")
-			
-			# extracting vectors from the blocks
-			energy, params, bindex, b2j, findex, f2j, deltal = rrblockreader(RRdata[i])
-			prrvec = rrparamblockunpacker(params)
-		
-			# masks to avoid unnecessary computation
-			bmask = bindex .∉ Ref(gsm)  # only to excited states
-			fmask = findex .∈ Ref(esm)  # only from ground state of O03
-			
-			# total mask of case B recombination
-			tmask = bmask .&& fmask
-		
-			# filtering our values to the ones we really care about
-			filtered_energy = energy[tmask]
-			filtered_prrvec = prrvec[tmask]
-			filtered_bindex = bindex[tmask]
-			filtered_b2j    = b2j[tmask]
-			filtered_findex = findex[tmask]
-			filtered_f2j    = f2j[tmask]
-			filtered_deltal = deltal[tmask]
-		
-			num = length(filtered_energy)
-	
-			# iterating through the elements in the block
-			for j in 1:1:num
-				# debugging statement that prints live to output so runtime can be monitored
-				
-				# iterating across test energies
-				for (k, energy) in enumerate(energies)
-					vnlindex = findfirst(isequal(filtered_bindex[j]), qilev)
-	
-					# vnl % 100 b.c. if n > 10, ℓ <= 10 -> goofing function if % 10 used
-					# implementation works with FAC manual description of VNL
-					lb = qvnls[vnlindex] % 100
-					
-					σ = radiativecrosssection(energy, 
-								   filtered_prrvec[j],
-								   filtered_b2j[j] + 1,
-								   filtered_f2j[j] + 1,
-								   lb,
-								   0,
-								   filtered_energy[j]
-								  )
-					crosssections[k] += σ
-				end
-			end
-		end
-
-		return crosssections
-	end
-end
-
-# ╔═╡ f1a53e3c-fd60-4c8c-8931-66a92e28dc36
-begin
-	# checks to see if the case B cross sections need to be calculated
-	# this takes two hours to compute so be ready
-	atomicnumber = 8
-		
-	minenergy 	= 0.0
-	maxenergy 	= 100.0
-	slice 		= 1 
-
-	#= default values for precomputed table
-	minenergy 	= 0.0   eV
-	maxenergy 	= 100.0 eV
-	slice 		= 0.01
-	=#
-
-	# these masks need to be dynamically coded instead of hardcoded eventually
-	# they were found by manually inspecting the .en files to find split ground states
-	groundstatemasks = [
-		[0],
-		[0],
-		[0],
-		[0],
-		[0, 1],
-		[0, 1, 2],
-		[0],
-		[0, 1, 2]]
-	# notice the excited state mask matches the pattern of the ground state mask
-	excitedstatemasks = [
-		[4],
-		[7],
-		[8],
-		[46],
-		[125],
-		[236, 237],
-		[272, 273, 274],
-		[266]]
-	
-	if !isfile("oxygen_caseB_crosssections.csv")
-		
-		energies = collect(minenergy:slice:maxenergy)
-		df = DataFrame(ENERGY = energies)
-
-		for nelectrons in 1:atomicnumber
-			verbose && @info("NELE: $nelectrons / $atomicnumber")
-			OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
-			OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
-
-			gsm = groundstatemasks[nelectrons]
-			esm = excitedstatemasks[nelectrons]
-			df[!, Symbol("NELE_$nelectrons")] = caseBxsection(energies, gsm, esm, OxygenENfile, OxygenRRfile)
-		end
-		
-		CSV.write("oxygen_caseB_crosssections.csv", df)
-	else
-		df = CSV.read("oxygen_caseB_crosssections.csv", DataFrame)
-	end
-
-	df
-end
-
-# ╔═╡ e76b3a9d-b32b-426a-813b-547c5ca0568b
-begin
-	nelectrons = 6
-	venergies = collect(minenergy:slice:maxenergy)
-	
-	verbose && @info("NELE: $nelectrons / $atomicnumber")
-	OxygenENfile = joinpath(fac_dir, "O0$(nelectrons)a.en")
-	OxygenRRfile = joinpath(fac_dir, "O0$(nelectrons)a.rr")
-
-	gsm = groundstatemasks[nelectrons]
-	esm = excitedstatemasks[nelectrons]
-	crosssections = caseBxsection(venergies, gsm, esm, OxygenENfile, OxygenRRfile)
-
-	# trying our hand at making an interpolation for the case B integrand
-	T = 1e4
-	
-	xs = minenergy:slice:maxenergy
-	ipt = linear_interpolation(xs, crosssections)
-end 
-
-# ╔═╡ a2d1538c-223a-4887-90d9-a29b42900e9a
-begin
-	integrand(x) = ipt(x) * maxwellianED(x, T)
-	integral, error = quadgk(x -> integrand(x), 0, 100)
-end
-
-# ╔═╡ e19ab3cd-a268-4fa7-826f-4ac25e523890
-plot(venergies, crosssections ./ 1e-20)
-
 # ╔═╡ Cell order:
 # ╠═fde54e19-d6fe-4134-84fb-c39be3c0eea2
 # ╠═06a00479-13de-4fc2-83c7-ba263895ad86
 # ╠═f1a53e3c-fd60-4c8c-8931-66a92e28dc36
-# ╠═e76b3a9d-b32b-426a-813b-547c5ca0568b
-# ╠═a2d1538c-223a-4887-90d9-a29b42900e9a
-# ╠═e19ab3cd-a268-4fa7-826f-4ac25e523890
+# ╠═2822d0de-da6f-4e1a-8df8-29eadb455fcc
+# ╠═9194879b-4d99-4416-bbf4-f1ac4820d40e
+# ╠═52c18186-8b20-4291-89a9-9e3c363d8be6
+# ╠═8ca245db-94b1-4f0c-b51d-9267114e9789
 # ╟─b30d80a6-fb36-4baf-bb75-a17e319566c3
 # ╠═fbb8819e-da92-4cd7-a3f0-811a27aa3ae4
 # ╠═1256163d-1be6-4742-a080-baf5136caf83
@@ -410,4 +392,3 @@ plot(venergies, crosssections ./ 1e-20)
 # ╠═1c6a1132-bd43-4d5b-a03c-08cf21fb24db
 # ╠═42ab7cc6-c06a-4d84-ba76-34c214526cbe
 # ╠═4f81ba64-7410-4a38-90d6-ded67520322d
-# ╠═dfc60ff1-db70-4d09-8215-80340b262eb5
